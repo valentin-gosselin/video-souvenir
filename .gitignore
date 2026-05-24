@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.pyo
+*.bak
+.venv/
+*.kdenlive
+souvenir-*.mp4

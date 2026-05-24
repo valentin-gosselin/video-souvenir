@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Video Souvenir
+GenericName=Assembleur de montage video
+Comment=Assemble des clips video en montage HEVC ou projet Kdenlive
+Exec=/home/goss/.local/bin/video-souvenir
+Icon=kdenlive
+Terminal=false
+Categories=AudioVideo;Video;AudioVideoEditing;Qt;
+StartupNotify=true
+StartupWMClass=Video Souvenir
+Keywords=video;montage;encode;hevc;kdenlive;ffmpeg;souvenir;plex;

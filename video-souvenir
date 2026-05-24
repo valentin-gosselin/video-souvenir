@@ -1,0 +1,654 @@
+#!/usr/bin/env python3
+"""
+video-souvenir - Assemble des clips video en un montage HEVC ou projet Kdenlive.
+
+Usage:
+  video-souvenir                          # ouvre l'UI PySide6
+  video-souvenir <dossier> [sortie]       # mode CLI
+"""
+
+import argparse
+import datetime
+import html
+import json
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+VIDEO_EXTS = {'.mp4', '.mov', '.mts', '.m2ts', '.avi', '.mkv'}
+
+# Fichiers auto-generes par ce script - a exclure du scan
+GENERATED_RE = re.compile(r'^souvenir-\d{8}-\d{6}\.(mp4|kdenlive)$', re.IGNORECASE)
+
+
+def detect_encoder():
+    try:
+        result = subprocess.run(['ffmpeg', '-hide_banner', '-encoders'],
+                                capture_output=True, text=True, timeout=10)
+        encoders = result.stdout
+    except Exception:
+        return None
+
+    try:
+        subprocess.run(['nvidia-smi', '-L'], capture_output=True, check=True, timeout=5)
+        if 'hevc_nvenc' in encoders:
+            return 'nvenc'
+    except Exception:
+        pass
+
+    has_dri = Path('/dev/dri/renderD128').exists()
+    if has_dri and 'hevc_qsv' in encoders:
+        return 'qsv'
+    if has_dri and 'hevc_vaapi' in encoders:
+        return 'vaapi'
+    if 'libx265' in encoders:
+        return 'x265'
+    return None
+
+
+def probe_video(path):
+    try:
+        cmd = ['ffprobe', '-v', 'error', '-print_format', 'json',
+               '-show_format', '-show_streams', str(path)]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if result.returncode != 0 or not result.stdout.strip():
+            return None
+        data = json.loads(result.stdout)
+    except Exception:
+        return None
+
+    info = {'path': str(path), 'name': Path(path).name,
+            'width': 0, 'height': 0, 'duration': 0.0, 'creation_time': None}
+
+    fmt = data.get('format', {})
+    try:
+        info['duration'] = float(fmt.get('duration', 0) or 0)
+    except (TypeError, ValueError):
+        pass
+
+    tags = fmt.get('tags', {}) or {}
+    info['creation_time'] = tags.get('creation_time')
+
+    for s in data.get('streams', []):
+        if s.get('codec_type') == 'video':
+            info['width'] = s.get('width', 0) or 0
+            info['height'] = s.get('height', 0) or 0
+            break
+
+    if not info['creation_time']:
+        mtime = datetime.datetime.fromtimestamp(Path(path).stat().st_mtime)
+        info['creation_time'] = mtime.isoformat()
+
+    return info
+
+
+def is_source_video(path):
+    p = Path(path)
+    return (p.is_file()
+            and p.suffix.lower() in VIDEO_EXTS
+            and not GENERATED_RE.match(p.name))
+
+
+def scan_folder(folder):
+    folder = Path(folder)
+    files = [p for p in folder.iterdir() if is_source_video(p)]
+    clips = []
+    for f in files:
+        info = probe_video(f)
+        if info and info['width'] > 0:
+            clips.append(info)
+    clips.sort(key=lambda c: c['creation_time'] or '')
+    return clips
+
+
+def cap_resolution(w, h, max_res):
+    caps = {'4k': (3840, 2160), '1080p': (1920, 1080), 'source': (99999, 99999)}
+    cap_w, cap_h = caps.get(max_res, (3840, 2160))
+    if w > cap_w:
+        ratio = h / w if w else 1
+        w = cap_w
+        h = int(cap_w * ratio)
+        if h > cap_h:
+            h = cap_h
+    if w % 2:
+        w -= 1
+    if h % 2:
+        h -= 1
+    return w, h
+
+
+def encoder_args(encoder, quality):
+    if encoder == 'nvenc':
+        return 'hevc_nvenc', ['-preset', 'p5', '-tune', 'hq', '-rc', 'vbr',
+                              '-cq', str(quality), '-b:v', '0', '-tag:v', 'hvc1']
+    if encoder == 'qsv':
+        return 'hevc_qsv', ['-preset', 'slow', '-global_quality', str(quality),
+                            '-tag:v', 'hvc1']
+    if encoder == 'vaapi':
+        return 'hevc_vaapi', ['-qp', str(quality), '-tag:v', 'hvc1']
+    if encoder == 'x265':
+        return 'libx265', ['-preset', 'medium', '-crf', str(quality), '-tag:v', 'hvc1']
+    raise ValueError(f"Encoder inconnu: {encoder}")
+
+
+def build_filter_complex(clips, max_w, max_h, fps):
+    parts = []
+    maps = ''
+    for i in range(len(clips)):
+        parts.append(
+            f"[{i}:v]scale={max_w}:{max_h}:force_original_aspect_ratio=decrease,"
+            f"pad={max_w}:{max_h}:(ow-iw)/2:(oh-ih)/2:black,"
+            f"setsar=1,fps={fps},format=yuv420p[v{i}];"
+        )
+        parts.append(
+            f"[{i}:a]aresample=48000,aformat=channel_layouts=stereo[a{i}];"
+        )
+        maps += f"[v{i}][a{i}]"
+    parts.append(f"{maps}concat=n={len(clips)}:v=1:a=1[outv][outa]")
+    return ''.join(parts)
+
+
+def build_ffmpeg_cmd(clips, output, encoder, quality, max_w, max_h, fps):
+    enc_name, enc_args = encoder_args(encoder, quality)
+    filter_complex = build_filter_complex(clips, max_w, max_h, fps)
+
+    cmd = ['ffmpeg', '-hide_banner', '-y']
+    for c in clips:
+        cmd += ['-i', c['path']]
+    cmd += ['-filter_complex', filter_complex,
+            '-map', '[outv]', '-map', '[outa]',
+            '-c:v', enc_name] + enc_args + [
+        '-c:a', 'aac', '-b:a', '192k',
+        '-movflags', '+faststart',
+        str(output),
+    ]
+    return cmd
+
+
+def sec_to_tc(seconds):
+    seconds = max(0.0, float(seconds))
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = seconds - h * 3600 - m * 60
+    return f"{h:02d}:{m:02d}:{s:06.3f}"
+
+
+def generate_kdenlive(clips, output_path, max_w, max_h, fps):
+    output_path = Path(output_path)
+    root_dir = str(output_path.parent.resolve())
+    total_sec = sum(c['duration'] for c in clips)
+    total_tc = sec_to_tc(total_sec)
+    doc_id = str(int(datetime.datetime.now().timestamp() * 1000))
+
+    def esc(s):
+        return html.escape(str(s), quote=True)
+
+    L = []
+    L.append('<?xml version="1.0" encoding="utf-8"?>')
+    L.append(f'<mlt LC_NUMERIC="C" version="7.30.0" producer="main_bin" root="{esc(root_dir)}">')
+    L.append(f'  <profile description="custom {max_w}x{max_h} {fps}fps" '
+             f'width="{max_w}" height="{max_h}" progressive="1" '
+             f'sample_aspect_num="1" sample_aspect_den="1" '
+             f'display_aspect_num="16" display_aspect_den="9" '
+             f'frame_rate_num="{fps}" frame_rate_den="1" colorspace="709"/>')
+
+    L.append('  <producer id="black_track" in="00:00:00.000" out="23:59:59.000">')
+    L.append('    <property name="length">2147483647</property>')
+    L.append('    <property name="eof">continue</property>')
+    L.append('    <property name="resource">0</property>')
+    L.append('    <property name="aspect_ratio">1</property>')
+    L.append('    <property name="mlt_service">color</property>')
+    L.append('    <property name="set.test_audio">0</property>')
+    L.append('    <property name="set.test_image">1</property>')
+    L.append('  </producer>')
+
+    for i, c in enumerate(clips):
+        dur_tc = sec_to_tc(c['duration'])
+        L.append(f'  <producer id="producer{i}" in="00:00:00.000" out="{dur_tc}">')
+        L.append(f'    <property name="length">{dur_tc}</property>')
+        L.append(f'    <property name="resource">{esc(c["path"])}</property>')
+        L.append('    <property name="mlt_service">avformat-novalidate</property>')
+        L.append('    <property name="audio_index">1</property>')
+        L.append('    <property name="video_index">0</property>')
+        L.append(f'    <property name="kdenlive:clipname">{esc(c["name"])}</property>')
+        L.append(f'    <property name="kdenlive:id">{i + 2}</property>')
+        L.append('  </producer>')
+
+    L.append('  <playlist id="main_bin">')
+    L.append(f'    <property name="kdenlive:docproperties.documentid">{doc_id}</property>')
+    L.append('    <property name="kdenlive:docproperties.kdenliveversion">24.05.2</property>')
+    L.append('    <property name="kdenlive:docproperties.version">1.1</property>')
+    L.append('    <property name="xml_retain">1</property>')
+    for i, c in enumerate(clips):
+        dur_tc = sec_to_tc(c['duration'])
+        L.append(f'    <entry producer="producer{i}" in="00:00:00.000" out="{dur_tc}"/>')
+    L.append('  </playlist>')
+
+    L.append('  <playlist id="playlist0">')
+    L.append('    <property name="kdenlive:audio_track">0</property>')
+    for i, c in enumerate(clips):
+        dur_tc = sec_to_tc(c['duration'])
+        L.append(f'    <entry producer="producer{i}" in="00:00:00.000" out="{dur_tc}"/>')
+    L.append('  </playlist>')
+    L.append('  <playlist id="playlist1">')
+    L.append('    <property name="kdenlive:audio_track">0</property>')
+    L.append('  </playlist>')
+
+    L.append(f'  <tractor id="tractor0" in="00:00:00.000" out="{total_tc}">')
+    L.append('    <property name="kdenlive:audio_track">0</property>')
+    L.append('    <property name="kdenlive:trackheight">100</property>')
+    L.append('    <property name="kdenlive:timeline_active">1</property>')
+    L.append('    <property name="kdenlive:track_name">V1</property>')
+    L.append('    <track producer="playlist0"/>')
+    L.append('    <track producer="playlist1"/>')
+    L.append('  </tractor>')
+
+    L.append(f'  <tractor id="maintractor" in="00:00:00.000" out="{total_tc}">')
+    L.append('    <track producer="black_track"/>')
+    L.append('    <track producer="tractor0"/>')
+    L.append('  </tractor>')
+
+    L.append('</mlt>')
+
+    output_path.write_text('\n'.join(L), encoding='utf-8')
+
+
+def run_cli(args):
+    folder = Path(args.folder)
+    if not folder.is_dir():
+        print(f"Erreur: '{folder}' n'est pas un dossier", file=sys.stderr)
+        return 1
+
+    print(f"Scan de {folder}...")
+    clips = scan_folder(folder)
+    if not clips:
+        print("Aucune video lisible trouvee (ffprobe a echoue sur tous les fichiers).",
+              file=sys.stderr)
+        print("Si tu vois des erreurs 'libopenh264', swap ffmpeg-free vers ffmpeg:",
+              file=sys.stderr)
+        print("  sudo dnf swap ffmpeg-free ffmpeg --allowerasing", file=sys.stderr)
+        return 1
+
+    print(f"{len(clips)} clips trouves (ordre chronologique):")
+    for c in clips:
+        print(f"  - {c['name']}  ({c['width']}x{c['height']}, {c['duration']:.1f}s)")
+
+    encoder = args.encoder
+    if encoder == 'auto':
+        encoder = detect_encoder()
+        if not encoder:
+            print("Aucun encoder HEVC disponible", file=sys.stderr)
+            return 1
+    print(f"Encoder: {encoder}")
+
+    out_base = args.output or str(folder / f"souvenir-{datetime.datetime.now():%Y%m%d-%H%M%S}.mp4")
+
+    max_w = max(c['width'] for c in clips)
+    max_h = max(c['height'] for c in clips)
+    max_w, max_h = cap_resolution(max_w, max_h, args.max_res)
+
+    if args.mode in ('kdenlive', 'both'):
+        kdenlive_path = Path(out_base).with_suffix('.kdenlive')
+        print(f"Generation projet Kdenlive: {kdenlive_path}")
+        generate_kdenlive(clips, kdenlive_path, max_w, max_h, args.fps)
+
+    if args.mode in ('render', 'both'):
+        print(f"Encodage: {out_base}")
+        cmd = build_ffmpeg_cmd(clips, out_base, encoder, args.quality, max_w, max_h, args.fps)
+        result = subprocess.run(cmd)
+        if result.returncode != 0:
+            return result.returncode
+        print(f"Termine: {out_base}")
+
+    return 0
+
+
+def run_ui():
+    try:
+        from PySide6.QtCore import Qt, QThread, Signal
+        from PySide6.QtGui import QFont
+        from PySide6.QtWidgets import (
+            QApplication, QComboBox, QFileDialog, QGridLayout, QGroupBox,
+            QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
+            QMainWindow, QMessageBox, QProgressBar, QPushButton, QSpinBox,
+            QTextEdit, QVBoxLayout, QWidget,
+        )
+    except ImportError:
+        print("PySide6 manque. Installe avec:", file=sys.stderr)
+        print("  /home/goss/miniconda3/bin/pip install PySide6", file=sys.stderr)
+        return 1
+
+    class ScanThread(QThread):
+        clip_found = Signal(dict)
+        finished_scan = Signal(int, int)
+        error = Signal(str)
+
+        def __init__(self, folder):
+            super().__init__()
+            self.folder = folder
+
+        def run(self):
+            try:
+                folder = Path(self.folder)
+                files = sorted([p for p in folder.iterdir() if is_source_video(p)])
+                ok = 0
+                ko = 0
+                for f in files:
+                    info = probe_video(f)
+                    if info and info['width'] > 0:
+                        self.clip_found.emit(info)
+                        ok += 1
+                    else:
+                        ko += 1
+                self.finished_scan.emit(ok, ko)
+            except Exception as e:
+                self.error.emit(str(e))
+
+    class EncodeThread(QThread):
+        log_line = Signal(str)
+        progress_pct = Signal(int)
+        done = Signal(int)
+
+        def __init__(self, cmd, kdenlive_args, total_duration):
+            super().__init__()
+            self.cmd = cmd
+            self.kdenlive_args = kdenlive_args
+            self.total_duration = total_duration
+
+        def run(self):
+            if self.kdenlive_args:
+                try:
+                    generate_kdenlive(*self.kdenlive_args)
+                    self.log_line.emit(f"Projet Kdenlive genere: {self.kdenlive_args[1]}")
+                except Exception as e:
+                    self.log_line.emit(f"Erreur Kdenlive: {e}")
+
+            if self.cmd is None:
+                self.done.emit(0)
+                return
+
+            self.log_line.emit("Commande: " + ' '.join(repr(a) if ' ' in a else a for a in self.cmd))
+            try:
+                proc = subprocess.Popen(self.cmd, stdout=subprocess.PIPE,
+                                        stderr=subprocess.STDOUT, text=True,
+                                        bufsize=1)
+                time_re = re.compile(r'time=(\d+):(\d+):(\d+\.\d+)')
+                for line in proc.stdout:
+                    line = line.rstrip()
+                    m = time_re.search(line)
+                    if m and self.total_duration > 0:
+                        h, mn, s = m.groups()
+                        elapsed = int(h) * 3600 + int(mn) * 60 + float(s)
+                        pct = min(100, int(elapsed / self.total_duration * 100))
+                        self.progress_pct.emit(pct)
+                    self.log_line.emit(line)
+                proc.wait()
+                self.done.emit(proc.returncode)
+            except Exception as e:
+                self.log_line.emit(f"Erreur: {e}")
+                self.done.emit(1)
+
+    class MainWindow(QMainWindow):
+        def __init__(self):
+            super().__init__()
+            self.setWindowTitle("Video Souvenir")
+            self.resize(900, 750)
+            self.clips = []
+            self.scan_thread = None
+            self.encode_thread = None
+            self._build_ui()
+
+        def _build_ui(self):
+            central = QWidget()
+            self.setCentralWidget(central)
+            layout = QVBoxLayout(central)
+
+            header = QLabel(
+                "<h2 style='margin:0'>Video Souvenir</h2>"
+                "<p style='margin:0;color:#888'>Assemble tes clips en montage HEVC ou projet Kdenlive pre-monte.</p>"
+            )
+            layout.addWidget(header)
+
+            folder_group = QGroupBox("Dossier source")
+            folder_layout = QHBoxLayout(folder_group)
+            self.folder_edit = QLineEdit()
+            self.folder_edit.setPlaceholderText("Selectionne un dossier contenant tes clips...")
+            self.folder_edit.returnPressed.connect(self.scan)
+            browse_btn = QPushButton("Parcourir...")
+            browse_btn.clicked.connect(self.browse_folder)
+            scan_btn = QPushButton("Scanner")
+            scan_btn.clicked.connect(self.scan)
+            folder_layout.addWidget(self.folder_edit, 1)
+            folder_layout.addWidget(browse_btn)
+            folder_layout.addWidget(scan_btn)
+            layout.addWidget(folder_group)
+
+            clips_group = QGroupBox("Clips (drag pour reordonner, Suppr pour retirer)")
+            clips_layout = QVBoxLayout(clips_group)
+            self.clip_list = QListWidget()
+            self.clip_list.setDragDropMode(QListWidget.InternalMove)
+            self.clip_list.setSelectionMode(QListWidget.ExtendedSelection)
+            self.clip_list.setAlternatingRowColors(True)
+            self.clip_list.installEventFilter(self)
+            clips_layout.addWidget(self.clip_list)
+            layout.addWidget(clips_group, 1)
+
+            opts_group = QGroupBox("Options d'encodage")
+            opts_layout = QGridLayout(opts_group)
+
+            opts_layout.addWidget(QLabel("Mode:"), 0, 0)
+            self.mode_combo = QComboBox()
+            self.mode_combo.addItems(['MP4 (HEVC)', 'Kdenlive (projet)', 'MP4 + Kdenlive'])
+            opts_layout.addWidget(self.mode_combo, 0, 1)
+
+            opts_layout.addWidget(QLabel("Encoder:"), 0, 2)
+            self.enc_combo = QComboBox()
+            self.enc_combo.addItems(['Auto', 'NVENC (GPU NVIDIA)', 'QSV (Intel)',
+                                     'VAAPI', 'x265 (CPU)'])
+            opts_layout.addWidget(self.enc_combo, 0, 3)
+
+            opts_layout.addWidget(QLabel("Qualite:"), 1, 0)
+            self.quality_spin = QSpinBox()
+            self.quality_spin.setRange(18, 30)
+            self.quality_spin.setValue(24)
+            self.quality_spin.setToolTip("18 = tres haute qualite, gros. 28 = compact.")
+            opts_layout.addWidget(self.quality_spin, 1, 1)
+
+            opts_layout.addWidget(QLabel("Resolution:"), 1, 2)
+            self.res_combo = QComboBox()
+            self.res_combo.addItems(['4K (3840x2160)', '1080p (1920x1080)', 'Source max'])
+            opts_layout.addWidget(self.res_combo, 1, 3)
+
+            opts_layout.addWidget(QLabel("FPS:"), 2, 0)
+            self.fps_combo = QComboBox()
+            self.fps_combo.addItems(['24', '25', '30', '50', '60'])
+            self.fps_combo.setCurrentText('30')
+            opts_layout.addWidget(self.fps_combo, 2, 1)
+
+            opts_layout.addWidget(QLabel("Sortie:"), 2, 2)
+            self.output_edit = QLineEdit()
+            self.output_edit.setPlaceholderText("Auto (souvenir-DATE.mp4 dans le dossier source)")
+            opts_layout.addWidget(self.output_edit, 2, 3)
+
+            layout.addWidget(opts_group)
+
+            self.launch_btn = QPushButton("Lancer")
+            self.launch_btn.setMinimumHeight(44)
+            f = QFont()
+            f.setBold(True)
+            f.setPointSize(11)
+            self.launch_btn.setFont(f)
+            self.launch_btn.clicked.connect(self.launch)
+            layout.addWidget(self.launch_btn)
+
+            self.progress = QProgressBar()
+            self.progress.setVisible(False)
+            layout.addWidget(self.progress)
+
+            log_group = QGroupBox("Log")
+            log_layout = QVBoxLayout(log_group)
+            self.log = QTextEdit()
+            self.log.setReadOnly(True)
+            self.log.setFont(QFont("monospace", 9))
+            log_layout.addWidget(self.log)
+            layout.addWidget(log_group, 1)
+
+        def eventFilter(self, obj, event):
+            if obj is self.clip_list and event.type() == event.Type.KeyPress:
+                if event.key() == Qt.Key_Delete:
+                    for item in self.clip_list.selectedItems():
+                        self.clip_list.takeItem(self.clip_list.row(item))
+                    return True
+            return super().eventFilter(obj, event)
+
+        def browse_folder(self):
+            start = self.folder_edit.text() or str(Path.home())
+            d = QFileDialog.getExistingDirectory(self, "Choisis le dossier source", start)
+            if d:
+                self.folder_edit.setText(d)
+                self.scan()
+
+        def scan(self):
+            folder = self.folder_edit.text().strip()
+            if not folder or not Path(folder).is_dir():
+                QMessageBox.warning(self, "Dossier invalide", "Choisis d'abord un dossier valide.")
+                return
+            self.clip_list.clear()
+            self.clips = []
+            self.log.append(f"--- Scan de {folder} ---")
+            self.scan_thread = ScanThread(folder)
+            self.scan_thread.clip_found.connect(self.on_clip_found)
+            self.scan_thread.finished_scan.connect(self.on_scan_done)
+            self.scan_thread.error.connect(lambda e: self.log.append(f"Erreur scan: {e}"))
+            self.scan_thread.start()
+
+        def on_clip_found(self, info):
+            self.clips.append(info)
+            self.clips.sort(key=lambda c: c.get('creation_time') or '')
+            self.clip_list.clear()
+            for c in self.clips:
+                m, s = divmod(int(c['duration']), 60)
+                label = f"{c['name']}    {c['width']}x{c['height']}    {m}m{s:02d}s"
+                item = QListWidgetItem(label)
+                item.setData(Qt.UserRole, c['path'])
+                self.clip_list.addItem(item)
+
+        def on_scan_done(self, ok, ko):
+            msg = f"--- {ok} clips lisibles"
+            if ko:
+                msg += f", {ko} illisibles (probablement en cours de sync ou corrompus)"
+            msg += " ---"
+            self.log.append(msg)
+            if ok == 0 and ko > 0:
+                QMessageBox.warning(
+                    self, "Aucun clip lisible",
+                    f"{ko} fichiers detectes mais ffprobe a echoue sur tous.\n\n"
+                    "Causes possibles : ffmpeg-free (decodeur H.264 casse), fichiers en cours\n"
+                    "de sync Nextcloud, ou format non supporte."
+                )
+
+        def get_ordered_clips(self):
+            ordered = []
+            for i in range(self.clip_list.count()):
+                path = self.clip_list.item(i).data(Qt.UserRole)
+                clip = next((c for c in self.clips if c['path'] == path), None)
+                if clip:
+                    ordered.append(clip)
+            return ordered
+
+        def launch(self):
+            clips = self.get_ordered_clips()
+            if not clips:
+                QMessageBox.warning(self, "Pas de clips", "Selectionne des clips d'abord.")
+                return
+
+            mode_map = {0: 'render', 1: 'kdenlive', 2: 'both'}
+            mode = mode_map[self.mode_combo.currentIndex()]
+
+            encoder_map = {0: 'auto', 1: 'nvenc', 2: 'qsv', 3: 'vaapi', 4: 'x265'}
+            encoder = encoder_map[self.enc_combo.currentIndex()]
+            if encoder == 'auto':
+                encoder = detect_encoder()
+                if not encoder:
+                    QMessageBox.critical(self, "Erreur", "Aucun encoder HEVC disponible.")
+                    return
+
+            res_map = {0: '4k', 1: '1080p', 2: 'source'}
+            max_res = res_map[self.res_combo.currentIndex()]
+            fps = int(self.fps_combo.currentText())
+            quality = self.quality_spin.value()
+
+            out = self.output_edit.text().strip()
+            if not out:
+                folder = Path(clips[0]['path']).parent
+                out = str(folder / f"souvenir-{datetime.datetime.now():%Y%m%d-%H%M%S}.mp4")
+
+            max_w = max(c['width'] for c in clips)
+            max_h = max(c['height'] for c in clips)
+            max_w, max_h = cap_resolution(max_w, max_h, max_res)
+
+            cmd = None
+            kdenlive_args = None
+            if mode in ('kdenlive', 'both'):
+                kdenlive_path = Path(out).with_suffix('.kdenlive')
+                kdenlive_args = (clips, kdenlive_path, max_w, max_h, fps)
+            if mode in ('render', 'both'):
+                cmd = build_ffmpeg_cmd(clips, out, encoder, quality, max_w, max_h, fps)
+
+            self.launch_btn.setEnabled(False)
+            self.progress.setVisible(True)
+            self.progress.setRange(0, 100)
+            self.progress.setValue(0)
+            self.log.append(
+                f"--- Lancement (mode={mode}, encoder={encoder}, {max_w}x{max_h}@{fps}fps, q={quality}) ---"
+            )
+
+            total_dur = sum(c['duration'] for c in clips)
+            self.encode_thread = EncodeThread(cmd, kdenlive_args, total_dur)
+            self.encode_thread.log_line.connect(self.log.append)
+            self.encode_thread.progress_pct.connect(self.progress.setValue)
+            self.encode_thread.done.connect(self.on_encode_done)
+            self.encode_thread.start()
+
+        def on_encode_done(self, code):
+            self.progress.setVisible(False)
+            self.launch_btn.setEnabled(True)
+            if code == 0:
+                self.log.append("--- Termine avec succes ---")
+                QMessageBox.information(self, "Termine", "Encodage / projet termine !")
+            else:
+                self.log.append(f"--- Echec (code {code}) ---")
+                QMessageBox.warning(self, "Erreur",
+                                    f"L'encodage a echoue (code {code}). Voir le log.")
+
+    app = QApplication(sys.argv)
+    app.setApplicationName("Video Souvenir")
+    app.setDesktopFileName("video-souvenir")
+    win = MainWindow()
+    win.show()
+    return app.exec()
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Assemble des clips video en montage HEVC ou projet Kdenlive."
+    )
+    parser.add_argument('folder', nargs='?', help="Dossier source. Si omis, ouvre l'UI.")
+    parser.add_argument('output', nargs='?', help="Fichier de sortie (auto si omis).")
+    parser.add_argument('--mode', choices=['render', 'kdenlive', 'both'], default='render')
+    parser.add_argument('--encoder', default='auto',
+                        choices=['auto', 'nvenc', 'qsv', 'vaapi', 'x265'])
+    parser.add_argument('--quality', type=int, default=24)
+    parser.add_argument('--fps', type=int, default=30)
+    parser.add_argument('--max-res', dest='max_res', default='4k',
+                        choices=['4k', '1080p', 'source'])
+    args = parser.parse_args()
+
+    if not args.folder:
+        return run_ui()
+    return run_cli(args)
+
+
+if __name__ == '__main__':
+    sys.exit(main())
