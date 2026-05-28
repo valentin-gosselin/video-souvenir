@@ -14,6 +14,7 @@ import json
 import re
 import subprocess
 import sys
+import uuid
 from pathlib import Path
 
 VIDEO_EXTS = {'.mp4', '.mov', '.mts', '.m2ts', '.avi', '.mkv'}
@@ -174,9 +175,40 @@ def sec_to_tc(seconds):
     return f"{h:02d}:{m:02d}:{s:06.3f}"
 
 
-def generate_kdenlive(clips, output_path, max_w, max_h, fps):
+FADE_SEC = 0.7
+
+
+def parse_iso_time(s):
+    if not s:
+        return None
+    try:
+        return datetime.datetime.fromisoformat(s.replace('Z', '+00:00'))
+    except (ValueError, TypeError):
+        return None
+
+
+def compute_break_indices(clips, gap_minutes):
+    """Return set of clip indices AFTER which to insert a black transition."""
+    if gap_minutes <= 0 or len(clips) < 2:
+        return set()
+    threshold = gap_minutes * 60
+    breaks = set()
+    for i in range(len(clips) - 1):
+        t_i = parse_iso_time(clips[i].get('creation_time'))
+        t_next = parse_iso_time(clips[i + 1].get('creation_time'))
+        if t_i is None or t_next is None:
+            continue
+        end_i = t_i + datetime.timedelta(seconds=clips[i]['duration'])
+        if (t_next - end_i).total_seconds() > threshold:
+            breaks.add(i)
+    return breaks
+
+
+def generate_kdenlive(clips, output_path, max_w, max_h, fps, gap_minutes=0):
     output_path = Path(output_path)
     root_dir = str(output_path.parent.resolve())
+    breaks = compute_break_indices(clips, gap_minutes)
+    fade_tc = sec_to_tc(FADE_SEC)
     total_sec = sum(c['duration'] for c in clips)
     total_tc = sec_to_tc(total_sec)
     doc_id = str(int(datetime.datetime.now().timestamp() * 1000))
@@ -215,38 +247,147 @@ def generate_kdenlive(clips, output_path, max_w, max_h, fps):
         L.append(f'    <property name="kdenlive:id">{i + 2}</property>')
         L.append('  </producer>')
 
+    seq_uuid = '{' + str(uuid.uuid4()) + '}'
+
+    L.append('  <playlist id="playlist0">')
+    L.append('    <property name="kdenlive:audio_track">1</property>')
+    for i, c in enumerate(clips):
+        dur_tc = sec_to_tc(c['duration'])
+        has_fadein = (i - 1) in breaks
+        has_fadeout = i in breaks
+        fade_each = min(FADE_SEC, c['duration'] / 3)
+        if has_fadein or has_fadeout:
+            L.append(f'    <entry producer="producer{i}" in="00:00:00.000" out="{dur_tc}">')
+            if has_fadein:
+                L.append(f'      <filter id="filter_a_fadein_{i}" in="00:00:00.000" out="{sec_to_tc(fade_each)}">')
+                L.append('        <property name="mlt_service">volume</property>')
+                L.append('        <property name="kdenlive_id">fade_from_black</property>')
+                L.append(f'        <property name="level">00:00:00.000=0;{sec_to_tc(fade_each)}=1</property>')
+                L.append('      </filter>')
+            if has_fadeout:
+                L.append(f'      <filter id="filter_a_fadeout_{i}" in="{sec_to_tc(c["duration"] - fade_each)}" out="{dur_tc}">')
+                L.append('        <property name="mlt_service">volume</property>')
+                L.append('        <property name="kdenlive_id">fade_to_black</property>')
+                L.append(f'        <property name="level">00:00:00.000=1;{sec_to_tc(fade_each)}=0</property>')
+                L.append('      </filter>')
+            L.append('    </entry>')
+        else:
+            L.append(f'    <entry producer="producer{i}" in="00:00:00.000" out="{dur_tc}"/>')
+    L.append('  </playlist>')
+    L.append('  <playlist id="playlist1">')
+    L.append('    <property name="kdenlive:audio_track">1</property>')
+    L.append('  </playlist>')
+
+    L.append(f'  <tractor id="tractor0" in="00:00:00.000" out="{total_tc}">')
+    L.append('    <property name="kdenlive:audio_track">1</property>')
+    L.append('    <property name="kdenlive:trackheight">62</property>')
+    L.append('    <property name="kdenlive:timeline_active">1</property>')
+    L.append('    <property name="kdenlive:track_name">A1</property>')
+    L.append('    <track hide="video" producer="playlist0"/>')
+    L.append('    <track hide="video" producer="playlist1"/>')
+    L.append('  </tractor>')
+
+    L.append('  <playlist id="playlist2">')
+    for i, c in enumerate(clips):
+        dur_tc = sec_to_tc(c['duration'])
+        has_fadein = (i - 1) in breaks
+        has_fadeout = i in breaks
+        fade_each = min(FADE_SEC, c['duration'] / 3)
+        if has_fadein or has_fadeout:
+            L.append(f'    <entry producer="producer{i}" in="00:00:00.000" out="{dur_tc}">')
+            if has_fadein:
+                L.append(f'      <filter id="filter_v_fadein_{i}" in="00:00:00.000" out="{sec_to_tc(fade_each)}">')
+                L.append('        <property name="mlt_service">brightness</property>')
+                L.append('        <property name="kdenlive_id">fade_from_black</property>')
+                L.append(f'        <property name="level">00:00:00.000=0;{sec_to_tc(fade_each)}=1</property>')
+                L.append('        <property name="alpha">1</property>')
+                L.append('      </filter>')
+            if has_fadeout:
+                L.append(f'      <filter id="filter_v_fadeout_{i}" in="{sec_to_tc(c["duration"] - fade_each)}" out="{dur_tc}">')
+                L.append('        <property name="mlt_service">brightness</property>')
+                L.append('        <property name="kdenlive_id">fade_to_black</property>')
+                L.append(f'        <property name="level">00:00:00.000=1;{sec_to_tc(fade_each)}=0</property>')
+                L.append('        <property name="alpha">1</property>')
+                L.append('      </filter>')
+            L.append('    </entry>')
+        else:
+            L.append(f'    <entry producer="producer{i}" in="00:00:00.000" out="{dur_tc}"/>')
+    L.append('  </playlist>')
+    L.append('  <playlist id="playlist3"/>')
+
+    L.append(f'  <tractor id="tractor1" in="00:00:00.000" out="{total_tc}">')
+    L.append('    <property name="kdenlive:trackheight">100</property>')
+    L.append('    <property name="kdenlive:timeline_active">1</property>')
+    L.append('    <property name="kdenlive:track_name">V1</property>')
+    L.append('    <track hide="audio" producer="playlist2"/>')
+    L.append('    <track hide="audio" producer="playlist3"/>')
+    L.append('  </tractor>')
+
+    groups = []
+    frame = 0
+    for c in clips:
+        groups.append({
+            "children": [
+                {"data": f"0:{frame}:-1", "leaf": "clip", "type": "Leaf"},
+                {"data": f"1:{frame}:-1", "leaf": "clip", "type": "Leaf"},
+            ],
+            "type": "AVSplit",
+        })
+        frame += int(round(c['duration'] * fps))
+    groups_json = json.dumps(groups, indent=4)
+
+    L.append(f'  <tractor id="{seq_uuid}" in="00:00:00.000" out="{total_tc}">')
+    L.append(f'    <property name="kdenlive:uuid">{seq_uuid}</property>')
+    L.append('    <property name="kdenlive:clipname">Sequence 1</property>')
+    L.append('    <property name="kdenlive:sequenceproperties.hasAudio">1</property>')
+    L.append('    <property name="kdenlive:sequenceproperties.hasVideo">1</property>')
+    L.append('    <property name="kdenlive:sequenceproperties.tracksCount">2</property>')
+    L.append(f'    <property name="kdenlive:sequenceproperties.documentuuid">{seq_uuid}</property>')
+    L.append(f'    <property name="kdenlive:control_uuid">{seq_uuid}</property>')
+    L.append('    <property name="kdenlive:producer_type">17</property>')
+    L.append('    <property name="kdenlive:sequenceproperties.activeTrack">1</property>')
+    L.append(f'    <property name="kdenlive:sequenceproperties.groups">{groups_json}</property>')
+    L.append('    <track producer="black_track"/>')
+    L.append('    <track producer="tractor0"/>')
+    L.append('    <track producer="tractor1"/>')
+    L.append('    <transition id="transition0">')
+    L.append('      <property name="a_track">0</property>')
+    L.append('      <property name="b_track">1</property>')
+    L.append('      <property name="mlt_service">mix</property>')
+    L.append('      <property name="kdenlive_id">mix</property>')
+    L.append('      <property name="internal_added">237</property>')
+    L.append('      <property name="always_active">1</property>')
+    L.append('      <property name="accepts_blanks">1</property>')
+    L.append('      <property name="sum">1</property>')
+    L.append('    </transition>')
+    L.append('    <transition id="transition1">')
+    L.append('      <property name="a_track">0</property>')
+    L.append('      <property name="b_track">2</property>')
+    L.append('      <property name="mlt_service">qtblend</property>')
+    L.append('      <property name="kdenlive_id">qtblend</property>')
+    L.append('      <property name="internal_added">237</property>')
+    L.append('      <property name="always_active">1</property>')
+    L.append('      <property name="compositing">0</property>')
+    L.append('    </transition>')
+    L.append('  </tractor>')
+
     L.append('  <playlist id="main_bin">')
     L.append(f'    <property name="kdenlive:docproperties.documentid">{doc_id}</property>')
+    L.append(f'    <property name="kdenlive:docproperties.uuid">{seq_uuid}</property>')
+    L.append(f'    <property name="kdenlive:docproperties.opensequences">{seq_uuid}</property>')
+    L.append(f'    <property name="kdenlive:docproperties.activetimeline">{seq_uuid}</property>')
     L.append('    <property name="kdenlive:docproperties.kdenliveversion">24.05.2</property>')
     L.append('    <property name="kdenlive:docproperties.version">1.1</property>')
     L.append('    <property name="xml_retain">1</property>')
     for i, c in enumerate(clips):
         dur_tc = sec_to_tc(c['duration'])
         L.append(f'    <entry producer="producer{i}" in="00:00:00.000" out="{dur_tc}"/>')
+    L.append(f'    <entry producer="{seq_uuid}" in="00:00:00.000" out="{total_tc}"/>')
     L.append('  </playlist>')
-
-    L.append('  <playlist id="playlist0">')
-    L.append('    <property name="kdenlive:audio_track">0</property>')
-    for i, c in enumerate(clips):
-        dur_tc = sec_to_tc(c['duration'])
-        L.append(f'    <entry producer="producer{i}" in="00:00:00.000" out="{dur_tc}"/>')
-    L.append('  </playlist>')
-    L.append('  <playlist id="playlist1">')
-    L.append('    <property name="kdenlive:audio_track">0</property>')
-    L.append('  </playlist>')
-
-    L.append(f'  <tractor id="tractor0" in="00:00:00.000" out="{total_tc}">')
-    L.append('    <property name="kdenlive:audio_track">0</property>')
-    L.append('    <property name="kdenlive:trackheight">100</property>')
-    L.append('    <property name="kdenlive:timeline_active">1</property>')
-    L.append('    <property name="kdenlive:track_name">V1</property>')
-    L.append('    <track producer="playlist0"/>')
-    L.append('    <track producer="playlist1"/>')
-    L.append('  </tractor>')
 
     L.append(f'  <tractor id="maintractor" in="00:00:00.000" out="{total_tc}">')
-    L.append('    <track producer="black_track"/>')
-    L.append('    <track producer="tractor0"/>')
+    L.append('    <property name="kdenlive:projectTractor">1</property>')
+    L.append(f'    <track in="00:00:00.000" out="{total_tc}" producer="{seq_uuid}"/>')
     L.append('  </tractor>')
 
     L.append('</mlt>')
@@ -291,7 +432,7 @@ def run_cli(args):
     if args.mode in ('kdenlive', 'both'):
         kdenlive_path = Path(out_base).with_suffix('.kdenlive')
         print(f"Generation projet Kdenlive: {kdenlive_path}")
-        generate_kdenlive(clips, kdenlive_path, max_w, max_h, args.fps)
+        generate_kdenlive(clips, kdenlive_path, max_w, max_h, args.fps, args.gap_minutes)
 
     if args.mode in ('render', 'both'):
         print(f"Encodage: {out_base}")
@@ -471,6 +612,18 @@ def run_ui():
             self.output_edit.setPlaceholderText("Auto (souvenir-DATE.mp4 dans le dossier source)")
             opts_layout.addWidget(self.output_edit, 2, 3)
 
+            opts_layout.addWidget(QLabel("Fondu noir si gap >:"), 3, 0)
+            self.gap_spin = QSpinBox()
+            self.gap_spin.setRange(0, 240)
+            self.gap_spin.setValue(20)
+            self.gap_spin.setSuffix(" min")
+            self.gap_spin.setToolTip(
+                "Ajoute un fondu enchaine par le noir entre clips quand l'intervalle reel\n"
+                "(heure de fin du clip i -> heure de debut du clip i+1) depasse ce seuil.\n"
+                "0 = desactive. (Mode Kdenlive uniquement pour l'instant.)"
+            )
+            opts_layout.addWidget(self.gap_spin, 3, 1)
+
             layout.addWidget(opts_group)
 
             self.launch_btn = QPushButton("Lancer")
@@ -592,7 +745,7 @@ def run_ui():
             kdenlive_args = None
             if mode in ('kdenlive', 'both'):
                 kdenlive_path = Path(out).with_suffix('.kdenlive')
-                kdenlive_args = (clips, kdenlive_path, max_w, max_h, fps)
+                kdenlive_args = (clips, kdenlive_path, max_w, max_h, fps, self.gap_spin.value())
             if mode in ('render', 'both'):
                 cmd = build_ffmpeg_cmd(clips, out, encoder, quality, max_w, max_h, fps)
 
@@ -643,6 +796,8 @@ def main():
     parser.add_argument('--fps', type=int, default=30)
     parser.add_argument('--max-res', dest='max_res', default='4k',
                         choices=['4k', '1080p', 'source'])
+    parser.add_argument('--gap-minutes', dest='gap_minutes', type=int, default=20,
+                        help="Seuil (min) au-dela duquel on insere un noir entre clips (Kdenlive). 0 = desactive.")
     args = parser.parse_args()
 
     if not args.folder:
