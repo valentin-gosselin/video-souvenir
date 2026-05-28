@@ -22,6 +22,104 @@ from pathlib import Path
 
 VIDEO_EXTS = {'.mp4', '.mov', '.mts', '.m2ts', '.avi', '.mkv'}
 
+# Presets de look applique a la piste video V1.
+# Chaque preset = dict d'eventuels filtres a empiler. None = preset neutre/custom.
+STYLE_PRESETS = {
+    'neutral': None,
+    'cinematic': {
+        'eq': {'brightness': -0.02, 'contrast': 1.10, 'saturation': 0.92,
+               'gamma': 1.05, 'gamma_r': 1.02, 'gamma_g': 1.00, 'gamma_b': 0.96},
+    },
+    'teal-orange': {
+        'eq': {'saturation': 1.10},
+        'colorbalance': {'bs': 0.15, 'gs': 0.05, 'rh': 0.10, 'gh': 0.03},
+    },
+    'vintage': {
+        'eq': {'brightness': 0.03, 'contrast': 0.92, 'saturation': 0.75,
+               'gamma_r': 0.95, 'gamma_g': 1.00, 'gamma_b': 1.05},
+    },
+    'doc': {
+        'eq': {'contrast': 1.18, 'saturation': 1.20},
+    },
+    'bw': {
+        'eq': {'saturation': 0.0, 'contrast': 1.15},
+    },
+    'custom': None,
+}
+
+STYLE_LABELS = [
+    ('neutral', 'Neutre'),
+    ('cinematic', 'Cinema chaud'),
+    ('teal-orange', 'Teal & Orange'),
+    ('vintage', 'Vintage'),
+    ('doc', 'Doc punchy'),
+    ('bw', 'Noir & Blanc'),
+    ('custom', 'Custom LUT...'),
+]
+
+
+def detect_folder_lut(folder):
+    """Cherche un .cube dans le dossier source. Prefere look.cube."""
+    folder = Path(folder)
+    cubes = sorted(folder.glob('*.cube'))
+    if not cubes:
+        return None
+    preferred = next((p for p in cubes if p.stem.lower() == 'look'), None)
+    return str(preferred or cubes[0])
+
+
+def style_filters_mlt(preset_name, custom_lut_path, esc):
+    """Renvoie la liste de lignes XML <filter> a inserer dans le tractor V1."""
+    lines = []
+    if preset_name == 'custom':
+        if custom_lut_path:
+            lines.append('    <filter id="filter_style_lut3d">')
+            lines.append('      <property name="mlt_service">avfilter.lut3d</property>')
+            lines.append(f'      <property name="av.file">{esc(custom_lut_path)}</property>')
+            lines.append('      <property name="kdenlive_id">avfilter.lut3d</property>')
+            lines.append('    </filter>')
+        return lines
+    preset = STYLE_PRESETS.get(preset_name)
+    if not preset:
+        return lines
+    idx = 0
+    if 'eq' in preset:
+        lines.append(f'    <filter id="filter_style_eq_{idx}">')
+        lines.append('      <property name="mlt_service">avfilter.eq</property>')
+        for k, v in preset['eq'].items():
+            lines.append(f'      <property name="av.{k}">{v}</property>')
+        lines.append('      <property name="kdenlive_id">avfilter.eq</property>')
+        lines.append('    </filter>')
+        idx += 1
+    if 'colorbalance' in preset:
+        lines.append(f'    <filter id="filter_style_colorbalance_{idx}">')
+        lines.append('      <property name="mlt_service">avfilter.colorbalance</property>')
+        for k, v in preset['colorbalance'].items():
+            lines.append(f'      <property name="av.{k}">{v}</property>')
+        lines.append('      <property name="kdenlive_id">avfilter.colorbalance</property>')
+        lines.append('    </filter>')
+    return lines
+
+
+def style_filter_ffmpeg(preset_name, custom_lut_path):
+    """Renvoie une chaine de filtres ffmpeg a inserer apres scale (vide si neutre)."""
+    if preset_name == 'custom':
+        if custom_lut_path:
+            return f"lut3d='{custom_lut_path}'"
+        return ''
+    preset = STYLE_PRESETS.get(preset_name)
+    if not preset:
+        return ''
+    chain = []
+    if 'eq' in preset:
+        params = ':'.join(f'{k}={v}' for k, v in preset['eq'].items())
+        chain.append(f'eq={params}')
+    if 'colorbalance' in preset:
+        params = ':'.join(f'{k}={v}' for k, v in preset['colorbalance'].items())
+        chain.append(f'colorbalance={params}')
+    return ','.join(chain)
+
+
 # Fichiers auto-generes par ce script - a exclure du scan
 GENERATED_RE = re.compile(r'^souvenir-\d{8}-\d{6}\.(mp4|kdenlive)$', re.IGNORECASE)
 
@@ -414,14 +512,16 @@ def encoder_args(encoder, quality):
     raise ValueError(f"Encoder inconnu: {encoder}")
 
 
-def build_filter_complex(clips, max_w, max_h, fps):
+def build_filter_complex(clips, max_w, max_h, fps, style='neutral', custom_lut=None):
+    style_chain = style_filter_ffmpeg(style, custom_lut)
+    style_segment = f',{style_chain}' if style_chain else ''
     parts = []
     maps = ''
     for i in range(len(clips)):
         parts.append(
             f"[{i}:v]scale={max_w}:{max_h}:force_original_aspect_ratio=decrease,"
             f"pad={max_w}:{max_h}:(ow-iw)/2:(oh-ih)/2:black,"
-            f"setsar=1,fps={fps},format=yuv420p[v{i}];"
+            f"setsar=1,fps={fps}{style_segment},format=yuv420p[v{i}];"
         )
         parts.append(
             f"[{i}:a]aresample=48000,aformat=channel_layouts=stereo[a{i}];"
@@ -431,9 +531,10 @@ def build_filter_complex(clips, max_w, max_h, fps):
     return ''.join(parts)
 
 
-def build_ffmpeg_cmd(clips, output, encoder, quality, max_w, max_h, fps):
+def build_ffmpeg_cmd(clips, output, encoder, quality, max_w, max_h, fps,
+                     style='neutral', custom_lut=None):
     enc_name, enc_args = encoder_args(encoder, quality)
-    filter_complex = build_filter_complex(clips, max_w, max_h, fps)
+    filter_complex = build_filter_complex(clips, max_w, max_h, fps, style, custom_lut)
 
     cmd = ['ffmpeg', '-hide_banner', '-y']
     for c in clips:
@@ -494,7 +595,8 @@ def compute_break_indices(clips, gap_minutes):
     return breaks
 
 
-def generate_kdenlive(clips, output_path, max_w, max_h, fps, gap_minutes=0):
+def generate_kdenlive(clips, output_path, max_w, max_h, fps, gap_minutes=0,
+                      style='neutral', custom_lut=None):
     output_path = Path(output_path)
     root_dir = str(output_path.parent.resolve())
     breaks = compute_break_indices(clips, gap_minutes)
@@ -619,6 +721,7 @@ def generate_kdenlive(clips, output_path, max_w, max_h, fps, gap_minutes=0):
     L.append('    <property name="kdenlive:track_name">V1</property>')
     L.append('    <track hide="audio" producer="playlist2"/>')
     L.append('    <track hide="audio" producer="playlist3"/>')
+    L.extend(style_filters_mlt(style, custom_lut, esc))
     L.append('  </tractor>')
 
     groups = []
@@ -702,6 +805,18 @@ def run_cli(args):
     print(f"Scan de {folder}...")
     trim_strength = args.trim_strength if args.auto_trim else 0
     clips = scan_folder(folder, auto_trim=args.auto_trim, trim_strength=trim_strength)
+    style = args.style
+    custom_lut = args.custom_lut
+    if not custom_lut:
+        auto_lut = detect_folder_lut(folder)
+        if auto_lut and style == 'neutral':
+            print(f"LUT auto-detectee dans le dossier: {auto_lut} -> style=custom")
+            style = 'custom'
+            custom_lut = auto_lut
+    if style == 'custom' and not custom_lut:
+        print("Style=custom mais aucun --lut fourni ni .cube detecte, fallback neutre.",
+              file=sys.stderr)
+        style = 'neutral'
     if not clips:
         print("Aucune video lisible trouvee (ffprobe a echoue sur tous les fichiers).",
               file=sys.stderr)
@@ -734,12 +849,14 @@ def run_cli(args):
 
     if args.mode in ('kdenlive', 'both'):
         kdenlive_path = Path(out_base).with_suffix('.kdenlive')
-        print(f"Generation projet Kdenlive: {kdenlive_path}")
-        generate_kdenlive(clips, kdenlive_path, max_w, max_h, args.fps, args.gap_minutes)
+        print(f"Generation projet Kdenlive: {kdenlive_path} (style={style})")
+        generate_kdenlive(clips, kdenlive_path, max_w, max_h, args.fps, args.gap_minutes,
+                          style=style, custom_lut=custom_lut)
 
     if args.mode in ('render', 'both'):
-        print(f"Encodage: {out_base}")
-        cmd = build_ffmpeg_cmd(clips, out_base, encoder, args.quality, max_w, max_h, args.fps)
+        print(f"Encodage: {out_base} (style={style})")
+        cmd = build_ffmpeg_cmd(clips, out_base, encoder, args.quality, max_w, max_h, args.fps,
+                               style=style, custom_lut=custom_lut)
         result = subprocess.run(cmd)
         if result.returncode != 0:
             return result.returncode
@@ -952,6 +1069,23 @@ def run_ui():
             )
             opts_layout.addWidget(self.trim_strength_spin, 3, 3)
 
+            opts_layout.addWidget(QLabel("Style:"), 4, 0)
+            self.style_combo = QComboBox()
+            for _, label in STYLE_LABELS:
+                self.style_combo.addItem(label)
+            self.style_combo.setToolTip(
+                "Look colorimetrique applique sur la piste V1. Les filtres sont editables\n"
+                "dans Kdenlive apres ouverture. 'Custom LUT...' permet de pointer vers un .cube."
+            )
+            self.style_combo.currentIndexChanged.connect(self._on_style_changed)
+            opts_layout.addWidget(self.style_combo, 4, 1)
+            self.lut_edit = QLineEdit()
+            self.lut_edit.setPlaceholderText("(auto si .cube dans dossier source)")
+            self.lut_browse_btn = QPushButton("LUT...")
+            self.lut_browse_btn.clicked.connect(self._on_browse_lut)
+            opts_layout.addWidget(self.lut_edit, 4, 2)
+            opts_layout.addWidget(self.lut_browse_btn, 4, 3)
+
             layout.addWidget(opts_group)
 
             self.launch_btn = QPushButton("Lancer")
@@ -974,6 +1108,24 @@ def run_ui():
             self.log.setFont(QFont("monospace", 9))
             log_layout.addWidget(self.log)
             layout.addWidget(log_group, 1)
+
+        def _on_style_changed(self, idx):
+            key = STYLE_LABELS[idx][0]
+            is_custom = (key == 'custom')
+            self.lut_edit.setEnabled(is_custom)
+            self.lut_browse_btn.setEnabled(is_custom)
+
+        def _on_browse_lut(self):
+            start = self.folder_edit.text() or str(Path.home())
+            f, _ = QFileDialog.getOpenFileName(self, "Choisis une LUT (.cube)", start,
+                                               "Cube LUT (*.cube)")
+            if f:
+                self.lut_edit.setText(f)
+                # bascule combo sur custom
+                for i, (key, _) in enumerate(STYLE_LABELS):
+                    if key == 'custom':
+                        self.style_combo.setCurrentIndex(i)
+                        break
 
         def eventFilter(self, obj, event):
             if obj is self.clip_list and event.type() == event.Type.KeyPress:
@@ -1000,6 +1152,17 @@ def run_ui():
             self.log.append(f"--- Scan de {folder} ---")
             auto_trim = self.trim_check.isChecked()
             strength = self.trim_strength_spin.value() if auto_trim else 0
+            # Auto-detect d'une LUT dans le dossier
+            auto_lut = detect_folder_lut(folder)
+            if auto_lut and not self.lut_edit.text():
+                self.lut_edit.setText(auto_lut)
+                self.log.append(f"LUT auto-detectee : {auto_lut}")
+                # passe sur custom si l'utilisateur n'a pas force un preset
+                if self.style_combo.currentIndex() == 0:  # neutral
+                    for i, (key, _) in enumerate(STYLE_LABELS):
+                        if key == 'custom':
+                            self.style_combo.setCurrentIndex(i)
+                            break
             self.scan_thread = ScanThread(folder, auto_trim=auto_trim, trim_strength=strength)
             self.scan_thread.clip_found.connect(self.on_clip_found)
             self.scan_thread.finished_scan.connect(self.on_scan_done)
@@ -1076,20 +1239,30 @@ def run_ui():
             max_h = max(c['height'] for c in clips)
             max_w, max_h = cap_resolution(max_w, max_h, max_res)
 
+            style_key = STYLE_LABELS[self.style_combo.currentIndex()][0]
+            custom_lut = self.lut_edit.text().strip() or None
+            if style_key == 'custom' and not custom_lut:
+                QMessageBox.warning(self, "LUT manquante",
+                                    "Style 'Custom LUT...' choisi mais aucun fichier .cube indique.")
+                self.launch_btn.setEnabled(True)
+                return
+
             cmd = None
             kdenlive_args = None
             if mode in ('kdenlive', 'both'):
                 kdenlive_path = Path(out).with_suffix('.kdenlive')
-                kdenlive_args = (clips, kdenlive_path, max_w, max_h, fps, self.gap_spin.value())
+                kdenlive_args = (clips, kdenlive_path, max_w, max_h, fps,
+                                 self.gap_spin.value(), style_key, custom_lut)
             if mode in ('render', 'both'):
-                cmd = build_ffmpeg_cmd(clips, out, encoder, quality, max_w, max_h, fps)
+                cmd = build_ffmpeg_cmd(clips, out, encoder, quality, max_w, max_h, fps,
+                                       style=style_key, custom_lut=custom_lut)
 
             self.launch_btn.setEnabled(False)
             self.progress.setVisible(True)
             self.progress.setRange(0, 100)
             self.progress.setValue(0)
             self.log.append(
-                f"--- Lancement (mode={mode}, encoder={encoder}, {max_w}x{max_h}@{fps}fps, q={quality}) ---"
+                f"--- Lancement (mode={mode}, encoder={encoder}, {max_w}x{max_h}@{fps}fps, q={quality}, style={style_key}) ---"
             )
 
             total_dur = sum(c['duration'] for c in clips)
@@ -1139,6 +1312,12 @@ def main():
                         help="Desactive l'auto-trim.")
     parser.add_argument('--trim-strength', dest='trim_strength', type=int, default=30,
                         help="Agressivite auto-trim 0-100 (0=off, 30=conservateur, 100=agressif).")
+    parser.add_argument('--style', default='neutral',
+                        choices=[k for k, _ in STYLE_LABELS],
+                        help="Style colorimetrique applique sur V1. 'custom' utilise --lut.")
+    parser.add_argument('--lut', dest='custom_lut', default=None,
+                        help="Chemin vers un fichier .cube (force style=custom). "
+                             "Sinon, auto-detect d'un .cube dans le dossier source.")
     args = parser.parse_args()
 
     if not args.folder:
