@@ -10,11 +10,14 @@ Usage:
 import argparse
 import datetime
 import html
+import io
 import json
+import os
 import re
 import subprocess
 import sys
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 VIDEO_EXTS = {'.mp4', '.mov', '.mts', '.m2ts', '.avi', '.mkv'}
@@ -48,6 +51,225 @@ def detect_encoder():
     return None
 
 
+def _strength_thresholds(strength):
+    """Map agressivite 0-100 vers les seuils silence/black/blur."""
+    if strength <= 0:
+        return None
+    s = max(0, min(100, strength)) / 100.0
+    return {
+        'silence_min_sec': 2.0 - 1.8 * s,
+        'silence_db': -30,
+        'black_min_sec': 0.5 - 0.4 * s,
+        'black_pix_th': 0.10,
+        'blur_var_th': 15 + 35 * s,
+        'edge_probe_count': 5,
+        'edge_probe_step': 0.4,
+    }
+
+
+def _parse_silence_edges(stderr, duration):
+    """Parse ffmpeg silencedetect output -> (trim_in, trim_out) candidates."""
+    starts = [float(m.group(1)) for m in re.finditer(r'silence_start:\s*(-?[\d.]+)', stderr)]
+    ends_data = re.findall(r'silence_end:\s*([\d.]+)\s*\|\s*silence_duration:\s*([\d.]+)', stderr)
+    trim_in = 0.0
+    trim_out = duration
+    # silence touchant le debut
+    if ends_data:
+        first_end, first_dur = float(ends_data[0][0]), float(ends_data[0][1])
+        if first_end - first_dur <= 0.05:
+            trim_in = first_end
+    # silence touchant la fin
+    if starts:
+        last_start = starts[-1]
+        # un silence qui demarre et n'a jamais de end -> jusqu'a la fin du clip
+        if len(starts) > len(ends_data) and last_start < duration:
+            trim_out = last_start
+        elif ends_data:
+            last_end = float(ends_data[-1][0])
+            if last_end >= duration - 0.1 and last_start < duration:
+                trim_out = last_start
+    return trim_in, trim_out
+
+
+def _detect_silence_edges(path, duration, db, min_sec):
+    cmd = ['ffmpeg', '-nostdin', '-hide_banner', '-i', str(path),
+           '-af', f'silencedetect=n={db}dB:d={min_sec}', '-vn', '-f', 'null', '-']
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        return _parse_silence_edges(r.stderr, duration)
+    except Exception:
+        return 0.0, duration
+
+
+def _parse_black_edges(stderr, duration):
+    pairs = re.findall(r'black_start:\s*([\d.]+)\s+black_end:\s*([\d.]+)', stderr)
+    trim_in = 0.0
+    trim_out = duration
+    if pairs:
+        first_start, first_end = float(pairs[0][0]), float(pairs[0][1])
+        if first_start <= 0.05:
+            trim_in = first_end
+        last_start, last_end = float(pairs[-1][0]), float(pairs[-1][1])
+        if last_end >= duration - 0.1:
+            trim_out = last_start
+    return trim_in, trim_out
+
+
+def _detect_black_edges(path, duration, min_sec, pix_th):
+    cmd = ['ffmpeg', '-nostdin', '-hide_banner', '-i', str(path),
+           '-vf', f'blackdetect=d={min_sec}:pix_th={pix_th}', '-an', '-f', 'null', '-']
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        return _parse_black_edges(r.stderr, duration)
+    except Exception:
+        return 0.0, duration
+
+
+def _laplacian_variance(png_bytes):
+    """Variance Laplacienne d'une frame PNG. Plus c'est haut, plus c'est net."""
+    try:
+        from PIL import Image
+        import numpy as np
+    except ImportError:
+        return None
+    try:
+        img = Image.open(io.BytesIO(png_bytes)).convert('L')
+        arr = np.asarray(img, dtype=np.float32)
+        # 3x3 Laplacian kernel approx via difference of neighbours
+        lap = (-4 * arr[1:-1, 1:-1]
+               + arr[:-2, 1:-1] + arr[2:, 1:-1]
+               + arr[1:-1, :-2] + arr[1:-1, 2:])
+        return float(lap.var())
+    except Exception:
+        return None
+
+
+def _extract_frame_png(path, t_sec, scale_w=320):
+    cmd = ['ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'error',
+           '-ss', f'{t_sec:.3f}', '-i', str(path),
+           '-frames:v', '1', '-vf', f'scale={scale_w}:-1',
+           '-f', 'image2', '-vcodec', 'png', '-']
+    try:
+        r = subprocess.run(cmd, capture_output=True, timeout=15)
+        if r.returncode == 0 and r.stdout:
+            return r.stdout
+    except Exception:
+        pass
+    return None
+
+
+def _detect_blur_edges(path, duration, var_th, probe_count, probe_step):
+    """Avance depuis le debut tant que les frames sont floues, recule depuis la fin idem."""
+    trim_in = 0.0
+    trim_out = duration
+    # debut
+    for k in range(probe_count):
+        t = k * probe_step
+        if t >= duration / 2:
+            break
+        png = _extract_frame_png(path, t)
+        if png is None:
+            break
+        v = _laplacian_variance(png)
+        if v is None:
+            break
+        if v >= var_th:
+            trim_in = t
+            break
+        trim_in = t + probe_step
+    # fin
+    for k in range(probe_count):
+        t = duration - (k + 1) * probe_step
+        if t <= duration / 2:
+            break
+        png = _extract_frame_png(path, t)
+        if png is None:
+            break
+        v = _laplacian_variance(png)
+        if v is None:
+            break
+        if v >= var_th:
+            trim_out = t + probe_step
+            break
+        trim_out = t
+    return trim_in, trim_out
+
+
+def analyze_trim(path, duration, strength):
+    """Renvoie (in_sec, out_sec, reasons) ou (0, duration, []) si strength=0 ou clip court."""
+    th = _strength_thresholds(strength)
+    if th is None or duration < 3.0:
+        return 0.0, duration, []
+    reasons = []
+    in_silence, out_silence = _detect_silence_edges(
+        path, duration, th['silence_db'], th['silence_min_sec'])
+    in_black, out_black = _detect_black_edges(
+        path, duration, th['black_min_sec'], th['black_pix_th'])
+    in_blur, out_blur = _detect_blur_edges(
+        path, duration, th['blur_var_th'], th['edge_probe_count'], th['edge_probe_step'])
+
+    in_pt = max(in_silence, in_black, in_blur)
+    out_pt = min(out_silence, out_black, out_blur)
+
+    if in_silence > 0.05:
+        reasons.append(f'silence-{in_silence:.1f}s')
+    if in_black > 0.05:
+        reasons.append(f'black-{in_black:.1f}s')
+    if in_blur > 0.05:
+        reasons.append(f'blur-{in_blur:.1f}s')
+    end_silence = duration - out_silence
+    end_black = duration - out_black
+    end_blur = duration - out_blur
+    if end_silence > 0.05:
+        reasons.append(f'silence-fin-{end_silence:.1f}s')
+    if end_black > 0.05:
+        reasons.append(f'black-fin-{end_black:.1f}s')
+    if end_blur > 0.05:
+        reasons.append(f'blur-fin-{end_blur:.1f}s')
+
+    # garde-fou : trimmed duration minimum
+    if out_pt - in_pt < 1.0:
+        return 0.0, duration, ['trim-skipped-too-short']
+    return in_pt, out_pt, reasons
+
+
+CACHE_VERSION = 1
+
+
+def _cache_path(folder):
+    return Path(folder) / '.video-souvenir-cache.json'
+
+
+def _load_trim_cache(folder):
+    p = _cache_path(folder)
+    try:
+        data = json.loads(p.read_text(encoding='utf-8'))
+        if data.get('version') == CACHE_VERSION:
+            return data.get('entries', {})
+    except Exception:
+        pass
+    return {}
+
+
+def _save_trim_cache(folder, entries):
+    p = _cache_path(folder)
+    try:
+        p.write_text(json.dumps(
+            {'version': CACHE_VERSION, 'entries': entries}, indent=2), encoding='utf-8')
+    except Exception:
+        pass
+
+
+def _cache_key(path):
+    """Cle stable = nom + mtime + taille. Ne pas hasher le contenu (couteux)."""
+    p = Path(path)
+    try:
+        st = p.stat()
+        return f'{p.name}|{int(st.st_mtime)}|{st.st_size}'
+    except OSError:
+        return None
+
+
 def probe_video(path):
     try:
         cmd = ['ffprobe', '-v', 'error', '-print_format', 'json',
@@ -60,7 +282,8 @@ def probe_video(path):
         return None
 
     info = {'path': str(path), 'name': Path(path).name,
-            'width': 0, 'height': 0, 'duration': 0.0, 'creation_time': None}
+            'width': 0, 'height': 0, 'duration': 0.0, 'creation_time': None,
+            'in_point': 0.0, 'out_point': 0.0, 'trim_reasons': []}
 
     fmt = data.get('format', {})
     try:
@@ -81,6 +304,7 @@ def probe_video(path):
         mtime = datetime.datetime.fromtimestamp(Path(path).stat().st_mtime)
         info['creation_time'] = mtime.isoformat()
 
+    info['out_point'] = info['duration']
     return info
 
 
@@ -91,7 +315,62 @@ def is_source_video(path):
             and not GENERATED_RE.match(p.name))
 
 
-def scan_folder(folder):
+def trimmed_duration(clip):
+    return max(0.0, clip['out_point'] - clip['in_point'])
+
+
+def apply_trim_analysis(clips, folder, strength, log=print):
+    """Calcule in_point/out_point pour chaque clip via analyze_trim + cache. Exclut les clips trop courts."""
+    if strength <= 0 or not clips:
+        return clips
+    cache = _load_trim_cache(folder)
+    to_analyze = []
+    for c in clips:
+        key = _cache_key(c['path'])
+        hit = cache.get(key) if key else None
+        if hit and hit.get('strength') == strength:
+            c['in_point'] = float(hit.get('in_point', 0.0))
+            c['out_point'] = float(hit.get('out_point', c['duration']))
+            c['trim_reasons'] = list(hit.get('reasons', []))
+        else:
+            to_analyze.append(c)
+
+    if to_analyze:
+        log(f'Auto-trim: analyse {len(to_analyze)} clip(s) (force={strength})...')
+        with ThreadPoolExecutor(max_workers=min(4, len(to_analyze))) as ex:
+            futures = {ex.submit(analyze_trim, c['path'], c['duration'], strength): c
+                       for c in to_analyze}
+            for fut in as_completed(futures):
+                c = futures[fut]
+                try:
+                    in_pt, out_pt, reasons = fut.result()
+                except Exception as e:
+                    log(f'  {c["name"]}: trim failed ({e}), garde duree complete')
+                    in_pt, out_pt, reasons = 0.0, c['duration'], []
+                c['in_point'] = in_pt
+                c['out_point'] = out_pt
+                c['trim_reasons'] = reasons
+                key = _cache_key(c['path'])
+                if key:
+                    cache[key] = {'strength': strength, 'in_point': in_pt,
+                                  'out_point': out_pt, 'reasons': reasons}
+        _save_trim_cache(folder, cache)
+
+    kept = []
+    for c in clips:
+        if trimmed_duration(c) < 1.0:
+            log(f'  exclu: {c["name"]} (duree trimmee < 1s, raisons: {c["trim_reasons"]})')
+            continue
+        if c['trim_reasons']:
+            saved = c['duration'] - trimmed_duration(c)
+            log(f'  {c["name"]}: -{saved:.1f}s ({", ".join(c["trim_reasons"])})')
+        kept.append(c)
+    total_saved = sum(c['duration'] - trimmed_duration(c) for c in kept)
+    log(f'Auto-trim: {len(clips) - len(kept)} clip(s) exclu(s), {total_saved:.1f}s economisees au total')
+    return kept
+
+
+def scan_folder(folder, auto_trim=False, trim_strength=30, log=print):
     folder = Path(folder)
     files = [p for p in folder.iterdir() if is_source_video(p)]
     clips = []
@@ -100,6 +379,8 @@ def scan_folder(folder):
         if info and info['width'] > 0:
             clips.append(info)
     clips.sort(key=lambda c: c['creation_time'] or '')
+    if auto_trim:
+        clips = apply_trim_analysis(clips, folder, trim_strength, log=log)
     return clips
 
 
@@ -156,6 +437,13 @@ def build_ffmpeg_cmd(clips, output, encoder, quality, max_w, max_h, fps):
 
     cmd = ['ffmpeg', '-hide_banner', '-y']
     for c in clips:
+        in_pt = c.get('in_point', 0.0)
+        out_pt = c.get('out_point', c['duration'])
+        # Input seeking (rapide en HW). -ss avant -i, -to absolu vs -ss.
+        if in_pt > 0.0:
+            cmd += ['-ss', f'{in_pt:.3f}']
+        if out_pt < c['duration'] - 0.001:
+            cmd += ['-to', f'{out_pt:.3f}']
         cmd += ['-i', c['path']]
     cmd += ['-filter_complex', filter_complex,
             '-map', '[outv]', '-map', '[outa]',
@@ -188,7 +476,8 @@ def parse_iso_time(s):
 
 
 def compute_break_indices(clips, gap_minutes):
-    """Return set of clip indices AFTER which to insert a black transition."""
+    """Return set of clip indices AFTER which to insert a black transition.
+    Le gap est calcule sur les bornes effectives (in/out_point), pas la duree brute."""
     if gap_minutes <= 0 or len(clips) < 2:
         return set()
     threshold = gap_minutes * 60
@@ -198,8 +487,9 @@ def compute_break_indices(clips, gap_minutes):
         t_next = parse_iso_time(clips[i + 1].get('creation_time'))
         if t_i is None or t_next is None:
             continue
-        end_i = t_i + datetime.timedelta(seconds=clips[i]['duration'])
-        if (t_next - end_i).total_seconds() > threshold:
+        end_i = t_i + datetime.timedelta(seconds=clips[i].get('out_point', clips[i]['duration']))
+        start_next = t_next + datetime.timedelta(seconds=clips[i + 1].get('in_point', 0.0))
+        if (start_next - end_i).total_seconds() > threshold:
             breaks.add(i)
     return breaks
 
@@ -209,7 +499,7 @@ def generate_kdenlive(clips, output_path, max_w, max_h, fps, gap_minutes=0):
     root_dir = str(output_path.parent.resolve())
     breaks = compute_break_indices(clips, gap_minutes)
     fade_tc = sec_to_tc(FADE_SEC)
-    total_sec = sum(c['duration'] for c in clips)
+    total_sec = sum(trimmed_duration(c) for c in clips)
     total_tc = sec_to_tc(total_sec)
     doc_id = str(int(datetime.datetime.now().timestamp() * 1000))
 
@@ -252,27 +542,31 @@ def generate_kdenlive(clips, output_path, max_w, max_h, fps, gap_minutes=0):
     L.append('  <playlist id="playlist0">')
     L.append('    <property name="kdenlive:audio_track">1</property>')
     for i, c in enumerate(clips):
-        dur_tc = sec_to_tc(c['duration'])
+        in_pt, out_pt = c['in_point'], c['out_point']
+        in_tc, out_tc = sec_to_tc(in_pt), sec_to_tc(out_pt)
+        tdur = trimmed_duration(c)
         has_fadein = (i - 1) in breaks
         has_fadeout = i in breaks
-        fade_each = min(FADE_SEC, c['duration'] / 3)
+        fade_each = min(FADE_SEC, tdur / 3)
         if has_fadein or has_fadeout:
-            L.append(f'    <entry producer="producer{i}" in="00:00:00.000" out="{dur_tc}">')
+            L.append(f'    <entry producer="producer{i}" in="{in_tc}" out="{out_tc}">')
             if has_fadein:
-                L.append(f'      <filter id="filter_a_fadein_{i}" in="00:00:00.000" out="{sec_to_tc(fade_each)}">')
+                fi_end = sec_to_tc(in_pt + fade_each)
+                L.append(f'      <filter id="filter_a_fadein_{i}" in="{in_tc}" out="{fi_end}">')
                 L.append('        <property name="mlt_service">volume</property>')
                 L.append('        <property name="kdenlive_id">fade_from_black</property>')
                 L.append(f'        <property name="level">00:00:00.000=0;{sec_to_tc(fade_each)}=1</property>')
                 L.append('      </filter>')
             if has_fadeout:
-                L.append(f'      <filter id="filter_a_fadeout_{i}" in="{sec_to_tc(c["duration"] - fade_each)}" out="{dur_tc}">')
+                fo_start = sec_to_tc(out_pt - fade_each)
+                L.append(f'      <filter id="filter_a_fadeout_{i}" in="{fo_start}" out="{out_tc}">')
                 L.append('        <property name="mlt_service">volume</property>')
                 L.append('        <property name="kdenlive_id">fade_to_black</property>')
                 L.append(f'        <property name="level">00:00:00.000=1;{sec_to_tc(fade_each)}=0</property>')
                 L.append('      </filter>')
             L.append('    </entry>')
         else:
-            L.append(f'    <entry producer="producer{i}" in="00:00:00.000" out="{dur_tc}"/>')
+            L.append(f'    <entry producer="producer{i}" in="{in_tc}" out="{out_tc}"/>')
     L.append('  </playlist>')
     L.append('  <playlist id="playlist1">')
     L.append('    <property name="kdenlive:audio_track">1</property>')
@@ -289,21 +583,25 @@ def generate_kdenlive(clips, output_path, max_w, max_h, fps, gap_minutes=0):
 
     L.append('  <playlist id="playlist2">')
     for i, c in enumerate(clips):
-        dur_tc = sec_to_tc(c['duration'])
+        in_pt, out_pt = c['in_point'], c['out_point']
+        in_tc, out_tc = sec_to_tc(in_pt), sec_to_tc(out_pt)
+        tdur = trimmed_duration(c)
         has_fadein = (i - 1) in breaks
         has_fadeout = i in breaks
-        fade_each = min(FADE_SEC, c['duration'] / 3)
+        fade_each = min(FADE_SEC, tdur / 3)
         if has_fadein or has_fadeout:
-            L.append(f'    <entry producer="producer{i}" in="00:00:00.000" out="{dur_tc}">')
+            L.append(f'    <entry producer="producer{i}" in="{in_tc}" out="{out_tc}">')
             if has_fadein:
-                L.append(f'      <filter id="filter_v_fadein_{i}" in="00:00:00.000" out="{sec_to_tc(fade_each)}">')
+                fi_end = sec_to_tc(in_pt + fade_each)
+                L.append(f'      <filter id="filter_v_fadein_{i}" in="{in_tc}" out="{fi_end}">')
                 L.append('        <property name="mlt_service">brightness</property>')
                 L.append('        <property name="kdenlive_id">fade_from_black</property>')
                 L.append(f'        <property name="level">00:00:00.000=0;{sec_to_tc(fade_each)}=1</property>')
                 L.append('        <property name="alpha">1</property>')
                 L.append('      </filter>')
             if has_fadeout:
-                L.append(f'      <filter id="filter_v_fadeout_{i}" in="{sec_to_tc(c["duration"] - fade_each)}" out="{dur_tc}">')
+                fo_start = sec_to_tc(out_pt - fade_each)
+                L.append(f'      <filter id="filter_v_fadeout_{i}" in="{fo_start}" out="{out_tc}">')
                 L.append('        <property name="mlt_service">brightness</property>')
                 L.append('        <property name="kdenlive_id">fade_to_black</property>')
                 L.append(f'        <property name="level">00:00:00.000=1;{sec_to_tc(fade_each)}=0</property>')
@@ -311,7 +609,7 @@ def generate_kdenlive(clips, output_path, max_w, max_h, fps, gap_minutes=0):
                 L.append('      </filter>')
             L.append('    </entry>')
         else:
-            L.append(f'    <entry producer="producer{i}" in="00:00:00.000" out="{dur_tc}"/>')
+            L.append(f'    <entry producer="producer{i}" in="{in_tc}" out="{out_tc}"/>')
     L.append('  </playlist>')
     L.append('  <playlist id="playlist3"/>')
 
@@ -333,7 +631,7 @@ def generate_kdenlive(clips, output_path, max_w, max_h, fps, gap_minutes=0):
             ],
             "type": "AVSplit",
         })
-        frame += int(round(c['duration'] * fps))
+        frame += int(round(trimmed_duration(c) * fps))
     groups_json = json.dumps(groups, indent=4)
 
     L.append(f'  <tractor id="{seq_uuid}" in="00:00:00.000" out="{total_tc}">')
@@ -402,7 +700,8 @@ def run_cli(args):
         return 1
 
     print(f"Scan de {folder}...")
-    clips = scan_folder(folder)
+    trim_strength = args.trim_strength if args.auto_trim else 0
+    clips = scan_folder(folder, auto_trim=args.auto_trim, trim_strength=trim_strength)
     if not clips:
         print("Aucune video lisible trouvee (ffprobe a echoue sur tous les fichiers).",
               file=sys.stderr)
@@ -413,7 +712,11 @@ def run_cli(args):
 
     print(f"{len(clips)} clips trouves (ordre chronologique):")
     for c in clips:
-        print(f"  - {c['name']}  ({c['width']}x{c['height']}, {c['duration']:.1f}s)")
+        td = trimmed_duration(c)
+        if td < c['duration'] - 0.05:
+            print(f"  - {c['name']}  ({c['width']}x{c['height']}, {td:.1f}s [trimme de {c['duration']:.1f}s])")
+        else:
+            print(f"  - {c['name']}  ({c['width']}x{c['height']}, {c['duration']:.1f}s)")
 
     encoder = args.encoder
     if encoder == 'auto':
@@ -450,10 +753,10 @@ def run_ui():
         from PySide6.QtCore import Qt, QThread, Signal
         from PySide6.QtGui import QFont
         from PySide6.QtWidgets import (
-            QApplication, QComboBox, QFileDialog, QGridLayout, QGroupBox,
-            QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
-            QMainWindow, QMessageBox, QProgressBar, QPushButton, QSpinBox,
-            QTextEdit, QVBoxLayout, QWidget,
+            QApplication, QCheckBox, QComboBox, QFileDialog, QGridLayout,
+            QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget,
+            QListWidgetItem, QMainWindow, QMessageBox, QProgressBar,
+            QPushButton, QSpinBox, QTextEdit, QVBoxLayout, QWidget,
         )
     except ImportError:
         print("PySide6 manque. Installe avec:", file=sys.stderr)
@@ -463,26 +766,35 @@ def run_ui():
     class ScanThread(QThread):
         clip_found = Signal(dict)
         finished_scan = Signal(int, int)
+        log_line = Signal(str)
         error = Signal(str)
 
-        def __init__(self, folder):
+        def __init__(self, folder, auto_trim=False, trim_strength=30):
             super().__init__()
             self.folder = folder
+            self.auto_trim = auto_trim
+            self.trim_strength = trim_strength
 
         def run(self):
             try:
                 folder = Path(self.folder)
                 files = sorted([p for p in folder.iterdir() if is_source_video(p)])
-                ok = 0
+                probed = []
                 ko = 0
                 for f in files:
                     info = probe_video(f)
                     if info and info['width'] > 0:
-                        self.clip_found.emit(info)
-                        ok += 1
+                        probed.append(info)
                     else:
                         ko += 1
-                self.finished_scan.emit(ok, ko)
+                # Tri chrono comme dans scan_folder
+                probed.sort(key=lambda c: c['creation_time'] or '')
+                if self.auto_trim and self.trim_strength > 0 and probed:
+                    probed = apply_trim_analysis(
+                        probed, folder, self.trim_strength, log=self.log_line.emit)
+                for info in probed:
+                    self.clip_found.emit(info)
+                self.finished_scan.emit(len(probed), ko)
             except Exception as e:
                 self.error.emit(str(e))
 
@@ -620,9 +932,25 @@ def run_ui():
             self.gap_spin.setToolTip(
                 "Ajoute un fondu enchaine par le noir entre clips quand l'intervalle reel\n"
                 "(heure de fin du clip i -> heure de debut du clip i+1) depasse ce seuil.\n"
-                "0 = desactive. (Mode Kdenlive uniquement pour l'instant.)"
+                "0 = desactive."
             )
             opts_layout.addWidget(self.gap_spin, 3, 1)
+
+            self.trim_check = QCheckBox("Auto-trim (silence/noir/flou)")
+            self.trim_check.setChecked(True)
+            self.trim_check.setToolTip(
+                "Detecte et coupe automatiquement les bordures creuses de chaque clip\n"
+                "(silence prolonge, frames noires/cramees, plans flous)."
+            )
+            opts_layout.addWidget(self.trim_check, 3, 2)
+            self.trim_strength_spin = QSpinBox()
+            self.trim_strength_spin.setRange(0, 100)
+            self.trim_strength_spin.setValue(30)
+            self.trim_strength_spin.setSuffix(" %")
+            self.trim_strength_spin.setToolTip(
+                "Agressivite du trim. 30 = conservateur (defaut), 70 = normal, 100 = agressif."
+            )
+            opts_layout.addWidget(self.trim_strength_spin, 3, 3)
 
             layout.addWidget(opts_group)
 
@@ -670,9 +998,12 @@ def run_ui():
             self.clip_list.clear()
             self.clips = []
             self.log.append(f"--- Scan de {folder} ---")
-            self.scan_thread = ScanThread(folder)
+            auto_trim = self.trim_check.isChecked()
+            strength = self.trim_strength_spin.value() if auto_trim else 0
+            self.scan_thread = ScanThread(folder, auto_trim=auto_trim, trim_strength=strength)
             self.scan_thread.clip_found.connect(self.on_clip_found)
             self.scan_thread.finished_scan.connect(self.on_scan_done)
+            self.scan_thread.log_line.connect(self.log.append)
             self.scan_thread.error.connect(lambda e: self.log.append(f"Erreur scan: {e}"))
             self.scan_thread.start()
 
@@ -681,8 +1012,12 @@ def run_ui():
             self.clips.sort(key=lambda c: c.get('creation_time') or '')
             self.clip_list.clear()
             for c in self.clips:
-                m, s = divmod(int(c['duration']), 60)
+                td = trimmed_duration(c)
+                m, s = divmod(int(td), 60)
                 label = f"{c['name']}    {c['width']}x{c['height']}    {m}m{s:02d}s"
+                if td < c['duration'] - 0.05:
+                    om, os_ = divmod(int(c['duration']), 60)
+                    label += f"  (orig {om}m{os_:02d}s)"
                 item = QListWidgetItem(label)
                 item.setData(Qt.UserRole, c['path'])
                 self.clip_list.addItem(item)
@@ -798,6 +1133,12 @@ def main():
                         choices=['4k', '1080p', 'source'])
     parser.add_argument('--gap-minutes', dest='gap_minutes', type=int, default=20,
                         help="Seuil (min) au-dela duquel on insere un noir entre clips (Kdenlive). 0 = desactive.")
+    parser.add_argument('--auto-trim', dest='auto_trim', action='store_true', default=True,
+                        help="Active l'auto-trim par clip (silence/noir/flou en debut/fin). Defaut: active.")
+    parser.add_argument('--no-auto-trim', dest='auto_trim', action='store_false',
+                        help="Desactive l'auto-trim.")
+    parser.add_argument('--trim-strength', dest='trim_strength', type=int, default=30,
+                        help="Agressivite auto-trim 0-100 (0=off, 30=conservateur, 100=agressif).")
     args = parser.parse_args()
 
     if not args.folder:
