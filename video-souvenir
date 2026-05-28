@@ -907,7 +907,11 @@ def parse_iso_time(s):
     if not s:
         return None
     try:
-        return datetime.datetime.fromisoformat(s.replace('Z', '+00:00'))
+        dt = datetime.datetime.fromisoformat(s.replace('Z', '+00:00'))
+        # Toujours retourner un naive UTC pour pouvoir comparer/soustraire facilement
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+        return dt
     except (ValueError, TypeError):
         return None
 
@@ -1038,17 +1042,21 @@ def generate_kdenlive(clips, output_path, max_w, max_h, fps, gap_minutes=0,
             music_dur_sec = float(r.stdout.strip() or 0)
         except Exception:
             music_dur_sec = 0.0
-        play_dur = min(music_dur_sec, total_sec) if music_dur_sec > 0 else total_sec
+        if music_dur_sec <= 0:
+            music_dur_sec = total_sec  # fallback si ffprobe a echoue
+        play_dur = min(music_dur_sec, total_sec)
         play_dur_tc = sec_to_tc(play_dur)
-        music_full_tc = sec_to_tc(max(music_dur_sec, total_sec))
-        L.append(f'  <producer id="producer_music" in="00:00:00.000" out="{music_full_tc}">')
-        L.append(f'    <property name="length">{music_full_tc}</property>')
+        music_dur_tc = sec_to_tc(music_dur_sec)
+        L.append(f'  <producer id="producer_music" in="00:00:00.000" out="{music_dur_tc}">')
+        L.append(f'    <property name="length">{music_dur_tc}</property>')
         L.append(f'    <property name="resource">{esc(str(music_path))}</property>')
         L.append('    <property name="mlt_service">avformat-novalidate</property>')
         L.append('    <property name="audio_index">0</property>')
         L.append('    <property name="video_index">-1</property>')
         L.append('    <property name="set.test_image">1</property>')
         L.append(f'    <property name="kdenlive:clipname">{esc(Path(music_path).name)}</property>')
+        L.append('    <property name="kdenlive:id">9999</property>')
+        L.append('    <property name="kdenlive:clip_type">2</property>')
         L.append('  </producer>')
         L.append('  <playlist id="playlist_music_0">')
         L.append('    <property name="kdenlive:audio_track">1</property>')
@@ -1190,6 +1198,8 @@ def generate_kdenlive(clips, output_path, max_w, max_h, fps, gap_minutes=0,
     for idx, parent in enumerate(parents_in_order):
         dur_tc = sec_to_tc(parent['duration'])
         L.append(f'    <entry producer="producer{idx}" in="00:00:00.000" out="{dur_tc}"/>')
+    if music_path:
+        L.append(f'    <entry producer="producer_music" in="00:00:00.000" out="{sec_to_tc(music_dur_sec)}"/>')
     L.append(f'    <entry producer="{seq_uuid}" in="00:00:00.000" out="{total_tc}"/>')
     L.append('  </playlist>')
 
