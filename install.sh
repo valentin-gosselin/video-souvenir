@@ -60,7 +60,8 @@ fi
 bold "Installation du script"
 BIN_DIR="$HOME/.local/bin"
 APP_DIR="$HOME/.local/share/applications"
-mkdir -p "$BIN_DIR" "$APP_DIR"
+ICON_DIR="$HOME/.local/share/icons/hicolor/scalable/apps"
+mkdir -p "$BIN_DIR" "$APP_DIR" "$ICON_DIR"
 
 # Substitue le shebang avec le Python detecte (pour que .desktop fonctionne sans PATH shell)
 sed "1s|.*|#!$PYTHON|" video-souvenir > "$BIN_DIR/video-souvenir"
@@ -70,6 +71,9 @@ ok "$BIN_DIR/video-souvenir"
 # Substitue le chemin du Exec= dans le .desktop pour matcher le user actuel
 sed "s|/home/goss/.local/bin/video-souvenir|$BIN_DIR/video-souvenir|g" video-souvenir.desktop > "$APP_DIR/video-souvenir.desktop"
 ok "$APP_DIR/video-souvenir.desktop"
+
+cp -f video-souvenir.svg "$ICON_DIR/video-souvenir.svg"
+ok "$ICON_DIR/video-souvenir.svg"
 
 # --- Refresh menu KDE/GNOME ---
 command -v kbuildsycoca6 >/dev/null && kbuildsycoca6 >/dev/null 2>&1 || true
