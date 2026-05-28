@@ -417,6 +417,261 @@ def trimmed_duration(clip):
     return max(0.0, clip['out_point'] - clip['in_point'])
 
 
+def detect_scenes(path, in_point, out_point, threshold=27.0, min_scene_len_sec=2.5,
+                  max_duration=120.0):
+    """Detecte les scenes via PySceneDetect dans la range. Renvoie liste (in, out) en secondes.
+    Downscale auto 4x sur 4K pour rester rapide. Bail sur clips trop longs (>max_duration)."""
+    if out_point - in_point > max_duration:
+        return None  # delegue au fixed-split
+    try:
+        from scenedetect import SceneManager, open_video, ContentDetector
+    except ImportError:
+        return None
+    try:
+        video = open_video(str(path))
+        fr = float(video.frame_rate or 30)
+        # Downscale agressif pour vitesse, surtout en 4K
+        try:
+            w, h = video.frame_size
+            if max(w, h) >= 3000:
+                video.set_downscale_factor(4)
+            elif max(w, h) >= 1500:
+                video.set_downscale_factor(2)
+        except Exception:
+            pass
+        sm = SceneManager()
+        sm.add_detector(ContentDetector(
+            threshold=threshold, min_scene_len=max(1, int(min_scene_len_sec * fr))))
+        try:
+            sm.detect_scenes(video=video, show_progress=False, duration=out_point - in_point)
+        except TypeError:
+            sm.detect_scenes(video=video, show_progress=False)
+        scenes = sm.get_scene_list()
+        if not scenes:
+            return [(in_point, out_point)]
+        cuts = []
+        for s in scenes:
+            s_in = max(in_point, s[0].seconds if hasattr(s[0], 'seconds') else s[0].get_seconds())
+            s_out = min(out_point, s[1].seconds if hasattr(s[1], 'seconds') else s[1].get_seconds())
+            if s_out - s_in >= 1.5:
+                cuts.append((s_in, s_out))
+        return cuts if cuts else [(in_point, out_point)]
+    except Exception:
+        return None
+
+
+def _fixed_split(in_pt, out_pt, step=8.0):
+    cuts = []
+    t = in_pt
+    while t < out_pt:
+        end = min(t + step, out_pt)
+        if end - t >= 1.5:
+            cuts.append((t, end))
+        t = end
+    return cuts
+
+
+def split_into_subclips(clips, target_minutes, log=print):
+    """Si target > 0 et clip > 30s, decoupe en sub-clips via scenedetect (parallele).
+    Sinon, un sub-clip = un clip trime."""
+    subclips_by_parent = [None] * len(clips)
+    to_detect = []
+    for parent_idx, c in enumerate(clips):
+        in_pt, out_pt = c['in_point'], c['out_point']
+        tdur = out_pt - in_pt
+        if target_minutes <= 0 or tdur < 30.0:
+            subclips_by_parent[parent_idx] = [(in_pt, out_pt)]
+        else:
+            to_detect.append(parent_idx)
+    if to_detect:
+        log(f'Scene detection sur {len(to_detect)} clip(s) long(s)...')
+        with ThreadPoolExecutor(max_workers=min(4, len(to_detect))) as ex:
+            futures = {}
+            for parent_idx in to_detect:
+                c = clips[parent_idx]
+                futures[ex.submit(detect_scenes, c['path'],
+                                  c['in_point'], c['out_point'])] = parent_idx
+            for fut in as_completed(futures):
+                parent_idx = futures[fut]
+                c = clips[parent_idx]
+                try:
+                    cuts = fut.result()
+                except Exception:
+                    cuts = None
+                if not cuts:
+                    cuts = _fixed_split(c['in_point'], c['out_point'], step=8.0)
+                subclips_by_parent[parent_idx] = cuts
+                if len(cuts) > 1:
+                    log(f'  {c["name"]}: {len(cuts)} sub-clips')
+    subclips = []
+    for parent_idx, c in enumerate(clips):
+        base = {
+            'path': c['path'],
+            'name': c['name'],
+            'parent_index': parent_idx,
+            'duration': c['duration'],
+            'creation_time': c['creation_time'],
+            'width': c['width'],
+            'height': c['height'],
+            'trim_reasons': c.get('trim_reasons', []),
+        }
+        for s_in, s_out in subclips_by_parent[parent_idx] or []:
+            sc = dict(base)
+            sc['in_point'] = s_in
+            sc['out_point'] = s_out
+            subclips.append(sc)
+    return subclips
+
+
+def _score_one_subclip(sc, sample_sec=2.0):
+    """Score 0-1 : netteté Laplacien + RMS audio sur 2s + duree."""
+    path = sc['path']
+    in_pt = sc['in_point']
+    out_pt = sc['out_point']
+    dur = max(0.001, out_pt - in_pt)
+    mid = (in_pt + out_pt) / 2
+    sharp_norm = 0.5
+    png = _extract_frame_png(path, mid)
+    if png:
+        v = _laplacian_variance(png)
+        if v is not None:
+            sharp_norm = min(1.0, v / 200.0)
+    # Audio sur une fenetre courte au milieu (sample_sec max)
+    audio_norm = 0.5
+    if dur >= 1.0:
+        sample_dur = min(sample_sec, dur)
+        sample_start = max(in_pt, mid - sample_dur / 2)
+        try:
+            cmd = ['ffmpeg', '-nostdin', '-hide_banner', '-ss', f'{sample_start:.3f}',
+                   '-i', str(path), '-t', f'{sample_dur:.3f}', '-af', 'volumedetect',
+                   '-vn', '-f', 'null', '-']
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+            m = re.search(r'mean_volume:\s*(-?[\d.]+)\s*dB', r.stderr)
+            if m:
+                v = float(m.group(1))
+                audio_norm = max(0.0, min(1.0, (v + 50.0) / 50.0))
+        except Exception:
+            pass
+    dur_factor = min(1.0, dur / 2.0)
+    return 0.5 * sharp_norm + 0.3 * audio_norm + 0.2 * dur_factor
+
+
+def _score_cache_key(sc):
+    """Cle stable pour le cache : path + mtime + size + range."""
+    base = _cache_key(sc['path'])
+    if not base:
+        return None
+    return f'{base}|{sc["in_point"]:.3f}|{sc["out_point"]:.3f}'
+
+
+def score_subclips(subclips, folder=None, log=print):
+    if not subclips:
+        return subclips
+    # Charge cache scores
+    cache = _load_trim_cache(folder) if folder else {}
+    scores_cache = cache.get('_scores', {}) if isinstance(cache, dict) else {}
+    to_score = []
+    for sc in subclips:
+        key = _score_cache_key(sc)
+        if key and key in scores_cache:
+            sc['score'] = scores_cache[key]
+        else:
+            to_score.append(sc)
+    if to_score:
+        log(f'Scoring {len(to_score)} sub-clip(s) (cache: {len(subclips) - len(to_score)})...')
+        with ThreadPoolExecutor(max_workers=min(4, len(to_score))) as ex:
+            futures = {ex.submit(_score_one_subclip, sc): sc for sc in to_score}
+            for fut in as_completed(futures):
+                sc = futures[fut]
+                try:
+                    sc['score'] = fut.result()
+                except Exception:
+                    sc['score'] = 0.5
+                key = _score_cache_key(sc)
+                if key:
+                    scores_cache[key] = sc['score']
+        if folder:
+            cache['_scores'] = scores_cache
+            _save_trim_cache(folder, cache)
+    return subclips
+
+
+def detect_beats(audio_path, log=print):
+    """Renvoie (bpm, beats_sec[]) via librosa. None si librosa absente ou erreur."""
+    try:
+        import librosa
+    except ImportError:
+        log("librosa indispo - installe avec: pip install librosa")
+        return None
+    try:
+        y, sr = librosa.load(str(audio_path), sr=22050, mono=True)
+        tempo, beat_frames = librosa.beat.beat_track(y=y, sr=sr)
+        beats_sec = librosa.frames_to_time(beat_frames, sr=sr)
+        return float(tempo), beats_sec.tolist()
+    except Exception as e:
+        log(f"beat detection failed: {e}")
+        return None
+
+
+def snap_subclips_to_beats(subclips, beats, tolerance=0.3, log=print):
+    """Ajuste les out_point/in_point pour aligner les transitions sur les beats les plus proches."""
+    if not beats or len(subclips) < 2:
+        return subclips
+    snapped = 0
+    timeline = 0.0
+    for i, sc in enumerate(subclips):
+        sc['_timeline_start'] = timeline
+        timeline += sc['out_point'] - sc['in_point']
+    # Itere sur les transitions (entre i et i+1, qui correspond a timeline_start de i+1)
+    for i in range(len(subclips) - 1):
+        cut_t = subclips[i + 1]['_timeline_start']
+        # beat le plus proche
+        nearest = min(beats, key=lambda b: abs(b - cut_t))
+        offset = nearest - cut_t
+        if abs(offset) <= tolerance:
+            prev = subclips[i]
+            new_out = prev['out_point'] + offset
+            min_out = prev['in_point'] + 0.5
+            max_out = prev.get('duration', new_out)
+            if min_out < new_out < max_out:
+                prev['out_point'] = new_out
+                # recalcul cumulatif
+                t = subclips[0]['_timeline_start']
+                for j in range(len(subclips)):
+                    subclips[j]['_timeline_start'] = t
+                    t += subclips[j]['out_point'] - subclips[j]['in_point']
+                snapped += 1
+    # nettoie cle interne
+    for sc in subclips:
+        sc.pop('_timeline_start', None)
+    log(f"Beat-sync: {snapped} cut(s) alignes sur beats")
+    return subclips
+
+
+def select_to_target(subclips, target_minutes, log=print):
+    if target_minutes <= 0 or not subclips:
+        return subclips
+    target_sec = target_minutes * 60
+    total_avail = sum(sc['out_point'] - sc['in_point'] for sc in subclips)
+    if total_avail <= target_sec * 1.05:
+        log(f'Duree disponible {total_avail:.1f}s deja proche de la cible {target_sec:.0f}s, on garde tout')
+        return subclips
+    sorted_by_score = sorted(subclips, key=lambda s: -s.get('score', 0))
+    selected = []
+    total = 0.0
+    for sc in sorted_by_score:
+        dur = sc['out_point'] - sc['in_point']
+        if total + dur > target_sec * 1.1:
+            continue
+        selected.append(sc)
+        total += dur
+        if total >= target_sec * 0.95:
+            break
+    selected.sort(key=lambda s: (s['parent_index'], s['in_point']))
+    log(f'Selection : {len(selected)}/{len(subclips)} sub-clips, {total:.1f}s / {target_sec:.0f}s cible')
+    return selected
+
+
 def apply_trim_analysis(clips, folder, strength, log=print):
     """Calcule in_point/out_point pour chaque clip via analyze_trim + cache. Exclut les clips trop courts."""
     if strength <= 0 or not clips:
@@ -468,7 +723,8 @@ def apply_trim_analysis(clips, folder, strength, log=print):
     return kept
 
 
-def scan_folder(folder, auto_trim=False, trim_strength=30, log=print):
+def scan_folder(folder, auto_trim=False, trim_strength=30, target_minutes=0,
+                music_path=None, beat_sync=False, log=print):
     folder = Path(folder)
     files = [p for p in folder.iterdir() if is_source_video(p)]
     clips = []
@@ -479,6 +735,16 @@ def scan_folder(folder, auto_trim=False, trim_strength=30, log=print):
     clips.sort(key=lambda c: c['creation_time'] or '')
     if auto_trim:
         clips = apply_trim_analysis(clips, folder, trim_strength, log=log)
+    if target_minutes > 0 and clips:
+        subclips = split_into_subclips(clips, target_minutes, log=log)
+        subclips = score_subclips(subclips, folder=folder, log=log)
+        clips = select_to_target(subclips, target_minutes, log=log)
+    if music_path and beat_sync and clips:
+        beats_info = detect_beats(music_path, log=log)
+        if beats_info:
+            bpm, beats = beats_info
+            log(f"Beats: {bpm:.1f} BPM, {len(beats)} marqueurs")
+            clips = snap_subclips_to_beats(clips, beats, log=log)
     return clips
 
 
@@ -512,7 +778,8 @@ def encoder_args(encoder, quality):
     raise ValueError(f"Encoder inconnu: {encoder}")
 
 
-def build_filter_complex(clips, max_w, max_h, fps, style='neutral', custom_lut=None):
+def build_filter_complex(clips, max_w, max_h, fps, style='neutral', custom_lut=None,
+                         with_music=False):
     style_chain = style_filter_ffmpeg(style, custom_lut)
     style_segment = f',{style_chain}' if style_chain else ''
     parts = []
@@ -527,25 +794,94 @@ def build_filter_complex(clips, max_w, max_h, fps, style='neutral', custom_lut=N
             f"[{i}:a]aresample=48000,aformat=channel_layouts=stereo[a{i}];"
         )
         maps += f"[v{i}][a{i}]"
-    parts.append(f"{maps}concat=n={len(clips)}:v=1:a=1[outv][outa]")
+    if with_music:
+        parts.append(f"{maps}concat=n={len(clips)}:v=1:a=1[outv][src_a];")
+        music_idx = len(clips)
+        parts.append(
+            f"[{music_idx}:a]aresample=48000,aformat=channel_layouts=stereo,volume=0.4[mus_a];"
+        )
+        parts.append("[src_a][mus_a]amix=inputs=2:duration=first:dropout_transition=0[outa]")
+    else:
+        parts.append(f"{maps}concat=n={len(clips)}:v=1:a=1[outv][outa]")
     return ''.join(parts)
 
 
+def build_preview_cmd(clips, output, encoder, max_w, max_h, fps,
+                      style='neutral', custom_lut=None, samples=12, sample_dur=1.0):
+    """Construit la cmd ffmpeg pour un preview court (~12s) compose d'extraits 1s."""
+    if not clips:
+        return None
+    # Echantillonnage uniforme dans la liste
+    n = min(samples, len(clips))
+    if len(clips) <= n:
+        picked = list(clips)
+    else:
+        step = len(clips) / n
+        picked = [clips[int(i * step)] for i in range(n)]
+    # Cap preview a 720p pour vitesse
+    pw = min(max_w, 1280)
+    ph = min(max_h, 720)
+    if pw % 2:
+        pw -= 1
+    if ph % 2:
+        ph -= 1
+
+    style_chain = style_filter_ffmpeg(style, custom_lut)
+    style_segment = f',{style_chain}' if style_chain else ''
+    enc_name = 'hevc_nvenc' if encoder == 'nvenc' else 'libx265'
+    enc_args = (['-preset', 'p1', '-tune', 'll', '-cq', '30', '-b:v', '0', '-tag:v', 'hvc1']
+                if encoder == 'nvenc'
+                else ['-preset', 'ultrafast', '-crf', '28', '-tag:v', 'hvc1'])
+
+    parts = []
+    maps = ''
+    cmd = ['ffmpeg', '-hide_banner', '-y']
+    for i, c in enumerate(picked):
+        in_pt = c.get('in_point', 0.0)
+        out_pt = c.get('out_point', c['duration'])
+        mid = (in_pt + out_pt) / 2
+        seg_dur = min(sample_dur, out_pt - in_pt)
+        seg_start = max(in_pt, mid - seg_dur / 2)
+        cmd += ['-ss', f'{seg_start:.3f}', '-t', f'{seg_dur:.3f}', '-i', c['path']]
+        parts.append(
+            f"[{i}:v]scale={pw}:{ph}:force_original_aspect_ratio=decrease,"
+            f"pad={pw}:{ph}:(ow-iw)/2:(oh-ih)/2:black,"
+            f"setsar=1,fps={fps}{style_segment},format=yuv420p[v{i}];"
+        )
+        parts.append(
+            f"[{i}:a]aresample=48000,aformat=channel_layouts=stereo[a{i}];"
+        )
+        maps += f"[v{i}][a{i}]"
+    parts.append(f"{maps}concat=n={len(picked)}:v=1:a=1[outv][outa]")
+    filter_complex = ''.join(parts)
+    cmd += ['-filter_complex', filter_complex,
+            '-map', '[outv]', '-map', '[outa]',
+            '-c:v', enc_name] + enc_args + [
+        '-c:a', 'aac', '-b:a', '96k',
+        '-movflags', '+faststart',
+        str(output),
+    ]
+    return cmd
+
+
 def build_ffmpeg_cmd(clips, output, encoder, quality, max_w, max_h, fps,
-                     style='neutral', custom_lut=None):
+                     style='neutral', custom_lut=None, music_path=None):
     enc_name, enc_args = encoder_args(encoder, quality)
-    filter_complex = build_filter_complex(clips, max_w, max_h, fps, style, custom_lut)
+    with_music = bool(music_path)
+    filter_complex = build_filter_complex(clips, max_w, max_h, fps, style, custom_lut,
+                                          with_music=with_music)
 
     cmd = ['ffmpeg', '-hide_banner', '-y']
     for c in clips:
         in_pt = c.get('in_point', 0.0)
         out_pt = c.get('out_point', c['duration'])
-        # Input seeking (rapide en HW). -ss avant -i, -to absolu vs -ss.
         if in_pt > 0.0:
             cmd += ['-ss', f'{in_pt:.3f}']
         if out_pt < c['duration'] - 0.001:
             cmd += ['-to', f'{out_pt:.3f}']
         cmd += ['-i', c['path']]
+    if with_music:
+        cmd += ['-stream_loop', '-1', '-i', str(music_path)]
     cmd += ['-filter_complex', filter_complex,
             '-map', '[outv]', '-map', '[outa]',
             '-c:v', enc_name] + enc_args + [
@@ -596,7 +932,7 @@ def compute_break_indices(clips, gap_minutes):
 
 
 def generate_kdenlive(clips, output_path, max_w, max_h, fps, gap_minutes=0,
-                      style='neutral', custom_lut=None):
+                      style='neutral', custom_lut=None, music_path=None):
     output_path = Path(output_path)
     root_dir = str(output_path.parent.resolve())
     breaks = compute_break_indices(clips, gap_minutes)
@@ -627,16 +963,24 @@ def generate_kdenlive(clips, output_path, max_w, max_h, fps, gap_minutes=0,
     L.append('    <property name="set.test_image">1</property>')
     L.append('  </producer>')
 
-    for i, c in enumerate(clips):
-        dur_tc = sec_to_tc(c['duration'])
-        L.append(f'  <producer id="producer{i}" in="00:00:00.000" out="{dur_tc}">')
+    # Deduplication des producers : un par parent (path unique)
+    # parent_index_of[path] -> index numerique du producer
+    parent_index_of = {}
+    parents_in_order = []
+    for c in clips:
+        if c['path'] not in parent_index_of:
+            parent_index_of[c['path']] = len(parents_in_order)
+            parents_in_order.append(c)
+    for idx, parent in enumerate(parents_in_order):
+        dur_tc = sec_to_tc(parent['duration'])
+        L.append(f'  <producer id="producer{idx}" in="00:00:00.000" out="{dur_tc}">')
         L.append(f'    <property name="length">{dur_tc}</property>')
-        L.append(f'    <property name="resource">{esc(c["path"])}</property>')
+        L.append(f'    <property name="resource">{esc(parent["path"])}</property>')
         L.append('    <property name="mlt_service">avformat-novalidate</property>')
         L.append('    <property name="audio_index">1</property>')
         L.append('    <property name="video_index">0</property>')
-        L.append(f'    <property name="kdenlive:clipname">{esc(c["name"])}</property>')
-        L.append(f'    <property name="kdenlive:id">{i + 2}</property>')
+        L.append(f'    <property name="kdenlive:clipname">{esc(parent["name"])}</property>')
+        L.append(f'    <property name="kdenlive:id">{idx + 2}</property>')
         L.append('  </producer>')
 
     seq_uuid = '{' + str(uuid.uuid4()) + '}'
@@ -651,7 +995,7 @@ def generate_kdenlive(clips, output_path, max_w, max_h, fps, gap_minutes=0,
         has_fadeout = i in breaks
         fade_each = min(FADE_SEC, tdur / 3)
         if has_fadein or has_fadeout:
-            L.append(f'    <entry producer="producer{i}" in="{in_tc}" out="{out_tc}">')
+            L.append(f'    <entry producer="producer{parent_index_of[c["path"]]}" in="{in_tc}" out="{out_tc}">')
             if has_fadein:
                 fi_end = sec_to_tc(in_pt + fade_each)
                 L.append(f'      <filter id="filter_a_fadein_{i}" in="{in_tc}" out="{fi_end}">')
@@ -668,7 +1012,7 @@ def generate_kdenlive(clips, output_path, max_w, max_h, fps, gap_minutes=0,
                 L.append('      </filter>')
             L.append('    </entry>')
         else:
-            L.append(f'    <entry producer="producer{i}" in="{in_tc}" out="{out_tc}"/>')
+            L.append(f'    <entry producer="producer{parent_index_of[c["path"]]}" in="{in_tc}" out="{out_tc}"/>')
     L.append('  </playlist>')
     L.append('  <playlist id="playlist1">')
     L.append('    <property name="kdenlive:audio_track">1</property>')
@@ -683,6 +1027,49 @@ def generate_kdenlive(clips, output_path, max_w, max_h, fps, gap_minutes=0,
     L.append('    <track hide="video" producer="playlist1"/>')
     L.append('  </tractor>')
 
+    # Piste A2 (musique) optionnelle. Inseree entre A1 et V1 dans la sequence.
+    music_dur_sec = 0.0
+    if music_path:
+        # Probe duree
+        try:
+            r = subprocess.run(['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+                                '-of', 'csv=p=0', str(music_path)],
+                               capture_output=True, text=True, timeout=15)
+            music_dur_sec = float(r.stdout.strip() or 0)
+        except Exception:
+            music_dur_sec = 0.0
+        play_dur = min(music_dur_sec, total_sec) if music_dur_sec > 0 else total_sec
+        play_dur_tc = sec_to_tc(play_dur)
+        music_full_tc = sec_to_tc(max(music_dur_sec, total_sec))
+        L.append(f'  <producer id="producer_music" in="00:00:00.000" out="{music_full_tc}">')
+        L.append(f'    <property name="length">{music_full_tc}</property>')
+        L.append(f'    <property name="resource">{esc(str(music_path))}</property>')
+        L.append('    <property name="mlt_service">avformat-novalidate</property>')
+        L.append('    <property name="audio_index">0</property>')
+        L.append('    <property name="video_index">-1</property>')
+        L.append('    <property name="set.test_image">1</property>')
+        L.append(f'    <property name="kdenlive:clipname">{esc(Path(music_path).name)}</property>')
+        L.append('  </producer>')
+        L.append('  <playlist id="playlist_music_0">')
+        L.append('    <property name="kdenlive:audio_track">1</property>')
+        L.append(f'    <entry producer="producer_music" in="00:00:00.000" out="{play_dur_tc}"/>')
+        L.append('  </playlist>')
+        L.append('  <playlist id="playlist_music_1">')
+        L.append('    <property name="kdenlive:audio_track">1</property>')
+        L.append('  </playlist>')
+        L.append(f'  <tractor id="tractor_music" in="00:00:00.000" out="{total_tc}">')
+        L.append('    <property name="kdenlive:audio_track">1</property>')
+        L.append('    <property name="kdenlive:trackheight">62</property>')
+        L.append('    <property name="kdenlive:timeline_active">1</property>')
+        L.append('    <property name="kdenlive:track_name">A2 (musique)</property>')
+        L.append('    <track hide="video" producer="playlist_music_0"/>')
+        L.append('    <track hide="video" producer="playlist_music_1"/>')
+        L.append('    <filter id="filter_music_level">')
+        L.append('      <property name="mlt_service">volume</property>')
+        L.append('      <property name="level">0.4</property>')
+        L.append('    </filter>')
+        L.append('  </tractor>')
+
     L.append('  <playlist id="playlist2">')
     for i, c in enumerate(clips):
         in_pt, out_pt = c['in_point'], c['out_point']
@@ -692,7 +1079,7 @@ def generate_kdenlive(clips, output_path, max_w, max_h, fps, gap_minutes=0,
         has_fadeout = i in breaks
         fade_each = min(FADE_SEC, tdur / 3)
         if has_fadein or has_fadeout:
-            L.append(f'    <entry producer="producer{i}" in="{in_tc}" out="{out_tc}">')
+            L.append(f'    <entry producer="producer{parent_index_of[c["path"]]}" in="{in_tc}" out="{out_tc}">')
             if has_fadein:
                 fi_end = sec_to_tc(in_pt + fade_each)
                 L.append(f'      <filter id="filter_v_fadein_{i}" in="{in_tc}" out="{fi_end}">')
@@ -711,7 +1098,7 @@ def generate_kdenlive(clips, output_path, max_w, max_h, fps, gap_minutes=0,
                 L.append('      </filter>')
             L.append('    </entry>')
         else:
-            L.append(f'    <entry producer="producer{i}" in="{in_tc}" out="{out_tc}"/>')
+            L.append(f'    <entry producer="producer{parent_index_of[c["path"]]}" in="{in_tc}" out="{out_tc}"/>')
     L.append('  </playlist>')
     L.append('  <playlist id="playlist3"/>')
 
@@ -724,13 +1111,16 @@ def generate_kdenlive(clips, output_path, max_w, max_h, fps, gap_minutes=0,
     L.extend(style_filters_mlt(style, custom_lut, esc))
     L.append('  </tractor>')
 
+    # Si musique presente : tracks ordonnees (apres black) sont A1, A2_musique, V1
+    # Group indices excluent black, donc audio=0, video=2 avec musique, 1 sans.
+    video_track_idx = 2 if music_path else 1
     groups = []
     frame = 0
     for c in clips:
         groups.append({
             "children": [
                 {"data": f"0:{frame}:-1", "leaf": "clip", "type": "Leaf"},
-                {"data": f"1:{frame}:-1", "leaf": "clip", "type": "Leaf"},
+                {"data": f"{video_track_idx}:{frame}:-1", "leaf": "clip", "type": "Leaf"},
             ],
             "type": "AVSplit",
         })
@@ -742,7 +1132,7 @@ def generate_kdenlive(clips, output_path, max_w, max_h, fps, gap_minutes=0,
     L.append('    <property name="kdenlive:clipname">Sequence 1</property>')
     L.append('    <property name="kdenlive:sequenceproperties.hasAudio">1</property>')
     L.append('    <property name="kdenlive:sequenceproperties.hasVideo">1</property>')
-    L.append('    <property name="kdenlive:sequenceproperties.tracksCount">2</property>')
+    L.append(f'    <property name="kdenlive:sequenceproperties.tracksCount">{3 if music_path else 2}</property>')
     L.append(f'    <property name="kdenlive:sequenceproperties.documentuuid">{seq_uuid}</property>')
     L.append(f'    <property name="kdenlive:control_uuid">{seq_uuid}</property>')
     L.append('    <property name="kdenlive:producer_type">17</property>')
@@ -750,7 +1140,10 @@ def generate_kdenlive(clips, output_path, max_w, max_h, fps, gap_minutes=0,
     L.append(f'    <property name="kdenlive:sequenceproperties.groups">{groups_json}</property>')
     L.append('    <track producer="black_track"/>')
     L.append('    <track producer="tractor0"/>')
+    if music_path:
+        L.append('    <track producer="tractor_music"/>')
     L.append('    <track producer="tractor1"/>')
+    # Audio mix transitions
     L.append('    <transition id="transition0">')
     L.append('      <property name="a_track">0</property>')
     L.append('      <property name="b_track">1</property>')
@@ -761,9 +1154,23 @@ def generate_kdenlive(clips, output_path, max_w, max_h, fps, gap_minutes=0,
     L.append('      <property name="accepts_blanks">1</property>')
     L.append('      <property name="sum">1</property>')
     L.append('    </transition>')
-    L.append('    <transition id="transition1">')
+    tidx = 1
+    if music_path:
+        tidx += 1
+        L.append(f'    <transition id="transition_audio_music">')
+        L.append('      <property name="a_track">0</property>')
+        L.append(f'      <property name="b_track">{tidx}</property>')
+        L.append('      <property name="mlt_service">mix</property>')
+        L.append('      <property name="kdenlive_id">mix</property>')
+        L.append('      <property name="internal_added">237</property>')
+        L.append('      <property name="always_active">1</property>')
+        L.append('      <property name="accepts_blanks">1</property>')
+        L.append('      <property name="sum">1</property>')
+        L.append('    </transition>')
+    tidx += 1
+    L.append(f'    <transition id="transition_video">')
     L.append('      <property name="a_track">0</property>')
-    L.append('      <property name="b_track">2</property>')
+    L.append(f'      <property name="b_track">{tidx}</property>')
     L.append('      <property name="mlt_service">qtblend</property>')
     L.append('      <property name="kdenlive_id">qtblend</property>')
     L.append('      <property name="internal_added">237</property>')
@@ -780,9 +1187,9 @@ def generate_kdenlive(clips, output_path, max_w, max_h, fps, gap_minutes=0,
     L.append('    <property name="kdenlive:docproperties.kdenliveversion">24.05.2</property>')
     L.append('    <property name="kdenlive:docproperties.version">1.1</property>')
     L.append('    <property name="xml_retain">1</property>')
-    for i, c in enumerate(clips):
-        dur_tc = sec_to_tc(c['duration'])
-        L.append(f'    <entry producer="producer{i}" in="00:00:00.000" out="{dur_tc}"/>')
+    for idx, parent in enumerate(parents_in_order):
+        dur_tc = sec_to_tc(parent['duration'])
+        L.append(f'    <entry producer="producer{idx}" in="00:00:00.000" out="{dur_tc}"/>')
     L.append(f'    <entry producer="{seq_uuid}" in="00:00:00.000" out="{total_tc}"/>')
     L.append('  </playlist>')
 
@@ -804,7 +1211,9 @@ def run_cli(args):
 
     print(f"Scan de {folder}...")
     trim_strength = args.trim_strength if args.auto_trim else 0
-    clips = scan_folder(folder, auto_trim=args.auto_trim, trim_strength=trim_strength)
+    clips = scan_folder(folder, auto_trim=args.auto_trim, trim_strength=trim_strength,
+                        target_minutes=args.target_minutes,
+                        music_path=args.music_path, beat_sync=args.beat_sync)
     style = args.style
     custom_lut = args.custom_lut
     if not custom_lut:
@@ -847,16 +1256,31 @@ def run_cli(args):
     max_h = max(c['height'] for c in clips)
     max_w, max_h = cap_resolution(max_w, max_h, args.max_res)
 
+    if args.preview:
+        preview_path = str(Path(out_base).with_name(
+            Path(out_base).stem + '-preview.mp4'))
+        print(f"Preview: {preview_path} (style={style})")
+        cmd = build_preview_cmd(clips, preview_path, encoder, max_w, max_h, args.fps,
+                                style=style, custom_lut=custom_lut)
+        if cmd is None:
+            print("Aucun clip pour preview", file=sys.stderr)
+            return 1
+        result = subprocess.run(cmd)
+        if result.returncode != 0:
+            return result.returncode
+        print(f"Termine: {preview_path}")
+        return 0
+
     if args.mode in ('kdenlive', 'both'):
         kdenlive_path = Path(out_base).with_suffix('.kdenlive')
         print(f"Generation projet Kdenlive: {kdenlive_path} (style={style})")
         generate_kdenlive(clips, kdenlive_path, max_w, max_h, args.fps, args.gap_minutes,
-                          style=style, custom_lut=custom_lut)
+                          style=style, custom_lut=custom_lut, music_path=args.music_path)
 
     if args.mode in ('render', 'both'):
         print(f"Encodage: {out_base} (style={style})")
         cmd = build_ffmpeg_cmd(clips, out_base, encoder, args.quality, max_w, max_h, args.fps,
-                               style=style, custom_lut=custom_lut)
+                               style=style, custom_lut=custom_lut, music_path=args.music_path)
         result = subprocess.run(cmd)
         if result.returncode != 0:
             return result.returncode
@@ -886,11 +1310,15 @@ def run_ui():
         log_line = Signal(str)
         error = Signal(str)
 
-        def __init__(self, folder, auto_trim=False, trim_strength=30):
+        def __init__(self, folder, auto_trim=False, trim_strength=30, target_minutes=0,
+                     music_path=None, beat_sync=False):
             super().__init__()
             self.folder = folder
             self.auto_trim = auto_trim
             self.trim_strength = trim_strength
+            self.target_minutes = target_minutes
+            self.music_path = music_path
+            self.beat_sync = beat_sync
 
         def run(self):
             try:
@@ -904,11 +1332,24 @@ def run_ui():
                         probed.append(info)
                     else:
                         ko += 1
-                # Tri chrono comme dans scan_folder
                 probed.sort(key=lambda c: c['creation_time'] or '')
                 if self.auto_trim and self.trim_strength > 0 and probed:
                     probed = apply_trim_analysis(
                         probed, folder, self.trim_strength, log=self.log_line.emit)
+                if self.target_minutes > 0 and probed:
+                    subclips = split_into_subclips(probed, self.target_minutes,
+                                                   log=self.log_line.emit)
+                    subclips = score_subclips(subclips, folder=folder,
+                                              log=self.log_line.emit)
+                    probed = select_to_target(subclips, self.target_minutes,
+                                              log=self.log_line.emit)
+                if self.music_path and self.beat_sync and probed:
+                    beats_info = detect_beats(self.music_path, log=self.log_line.emit)
+                    if beats_info:
+                        bpm, beats = beats_info
+                        self.log_line.emit(f"Beats: {bpm:.1f} BPM, {len(beats)} marqueurs")
+                        probed = snap_subclips_to_beats(probed, beats,
+                                                        log=self.log_line.emit)
                 for info in probed:
                     self.clip_found.emit(info)
                 self.finished_scan.emit(len(probed), ko)
@@ -1086,8 +1527,44 @@ def run_ui():
             opts_layout.addWidget(self.lut_edit, 4, 2)
             opts_layout.addWidget(self.lut_browse_btn, 4, 3)
 
+            opts_layout.addWidget(QLabel("Duree cible:"), 5, 0)
+            self.target_spin = QSpinBox()
+            self.target_spin.setRange(0, 60)
+            self.target_spin.setValue(0)
+            self.target_spin.setSuffix(" min")
+            self.target_spin.setSpecialValueText("Desactive")
+            self.target_spin.setToolTip(
+                "Si > 0 : decoupe les clips longs en sub-clips, score chacun (nettete + audio + duree)\n"
+                "et garde les meilleurs pour s'approcher de la cible. 0 = tout garder.\n"
+                "Le scan est plus long (~1s par sub-clip). Re-scan apres changement."
+            )
+            opts_layout.addWidget(self.target_spin, 5, 1)
+
+            opts_layout.addWidget(QLabel("Musique:"), 6, 0)
+            self.music_edit = QLineEdit()
+            self.music_edit.setPlaceholderText("(optionnel)")
+            self.music_browse_btn = QPushButton("Audio...")
+            self.music_browse_btn.clicked.connect(self._on_browse_music)
+            opts_layout.addWidget(self.music_edit, 6, 1)
+            opts_layout.addWidget(self.music_browse_btn, 6, 2)
+            self.beatsync_check = QCheckBox("Sync sur beats")
+            self.beatsync_check.setToolTip(
+                "Aligne les transitions entre sub-clips sur les beats detectes de la musique.\n"
+                "Necessite librosa (pip install librosa). Recommande avec une Duree cible > 0."
+            )
+            opts_layout.addWidget(self.beatsync_check, 6, 3)
+
             layout.addWidget(opts_group)
 
+            btn_row = QHBoxLayout()
+            self.preview_btn = QPushButton("Preview ~12s")
+            self.preview_btn.setMinimumHeight(44)
+            self.preview_btn.setToolTip(
+                "Genere un MP4 court (~12s) compose d'extraits 1s pris dans le montage propose.\n"
+                "Utile pour valider style + selection avant un render complet."
+            )
+            self.preview_btn.clicked.connect(lambda: self.launch(preview=True))
+            btn_row.addWidget(self.preview_btn, 1)
             self.launch_btn = QPushButton("Lancer")
             self.launch_btn.setMinimumHeight(44)
             f = QFont()
@@ -1095,7 +1572,8 @@ def run_ui():
             f.setPointSize(11)
             self.launch_btn.setFont(f)
             self.launch_btn.clicked.connect(self.launch)
-            layout.addWidget(self.launch_btn)
+            btn_row.addWidget(self.launch_btn, 2)
+            layout.addLayout(btn_row)
 
             self.progress = QProgressBar()
             self.progress.setVisible(False)
@@ -1126,6 +1604,13 @@ def run_ui():
                     if key == 'custom':
                         self.style_combo.setCurrentIndex(i)
                         break
+
+        def _on_browse_music(self):
+            start = self.folder_edit.text() or str(Path.home())
+            f, _ = QFileDialog.getOpenFileName(self, "Choisis une musique", start,
+                                               "Audio (*.mp3 *.wav *.flac *.m4a *.ogg)")
+            if f:
+                self.music_edit.setText(f)
 
         def eventFilter(self, obj, event):
             if obj is self.clip_list and event.type() == event.Type.KeyPress:
@@ -1163,7 +1648,12 @@ def run_ui():
                         if key == 'custom':
                             self.style_combo.setCurrentIndex(i)
                             break
-            self.scan_thread = ScanThread(folder, auto_trim=auto_trim, trim_strength=strength)
+            target = self.target_spin.value()
+            music_path = self.music_edit.text().strip() or None
+            beat_sync = self.beatsync_check.isChecked()
+            self.scan_thread = ScanThread(folder, auto_trim=auto_trim, trim_strength=strength,
+                                          target_minutes=target, music_path=music_path,
+                                          beat_sync=beat_sync)
             self.scan_thread.clip_found.connect(self.on_clip_found)
             self.scan_thread.finished_scan.connect(self.on_scan_done)
             self.scan_thread.log_line.connect(self.log.append)
@@ -1171,18 +1661,28 @@ def run_ui():
             self.scan_thread.start()
 
         def on_clip_found(self, info):
+            # Assigne un id unique pour permettre les sub-clips multiples du meme path
+            info['_uid'] = f"{info['path']}|{info.get('in_point', 0.0):.3f}|{info.get('out_point', 0.0):.3f}"
             self.clips.append(info)
-            self.clips.sort(key=lambda c: c.get('creation_time') or '')
+            self.clips.sort(key=lambda c: (c.get('creation_time') or '', c.get('in_point', 0.0)))
             self.clip_list.clear()
+            # detection cas sub-clipping pour ajouter un suffixe utile
+            path_counts = {}
+            for c in self.clips:
+                path_counts[c['path']] = path_counts.get(c['path'], 0) + 1
+            seen_per_path = {}
             for c in self.clips:
                 td = trimmed_duration(c)
                 m, s = divmod(int(td), 60)
                 label = f"{c['name']}    {c['width']}x{c['height']}    {m}m{s:02d}s"
-                if td < c['duration'] - 0.05:
+                if path_counts[c['path']] > 1:
+                    seen_per_path[c['path']] = seen_per_path.get(c['path'], 0) + 1
+                    label += f"  [#{seen_per_path[c['path']]} {c['in_point']:.1f}-{c['out_point']:.1f}s]"
+                elif td < c['duration'] - 0.05:
                     om, os_ = divmod(int(c['duration']), 60)
                     label += f"  (orig {om}m{os_:02d}s)"
                 item = QListWidgetItem(label)
-                item.setData(Qt.UserRole, c['path'])
+                item.setData(Qt.UserRole, c['_uid'])
                 self.clip_list.addItem(item)
 
         def on_scan_done(self, ok, ko):
@@ -1202,13 +1702,13 @@ def run_ui():
         def get_ordered_clips(self):
             ordered = []
             for i in range(self.clip_list.count()):
-                path = self.clip_list.item(i).data(Qt.UserRole)
-                clip = next((c for c in self.clips if c['path'] == path), None)
+                uid = self.clip_list.item(i).data(Qt.UserRole)
+                clip = next((c for c in self.clips if c.get('_uid') == uid), None)
                 if clip:
                     ordered.append(clip)
             return ordered
 
-        def launch(self):
+        def launch(self, preview=False):
             clips = self.get_ordered_clips()
             if not clips:
                 QMessageBox.warning(self, "Pas de clips", "Selectionne des clips d'abord.")
@@ -1244,28 +1744,40 @@ def run_ui():
             if style_key == 'custom' and not custom_lut:
                 QMessageBox.warning(self, "LUT manquante",
                                     "Style 'Custom LUT...' choisi mais aucun fichier .cube indique.")
-                self.launch_btn.setEnabled(True)
                 return
 
+            music_path = self.music_edit.text().strip() or None
+            self._preview_output = None
             cmd = None
             kdenlive_args = None
-            if mode in ('kdenlive', 'both'):
-                kdenlive_path = Path(out).with_suffix('.kdenlive')
-                kdenlive_args = (clips, kdenlive_path, max_w, max_h, fps,
-                                 self.gap_spin.value(), style_key, custom_lut)
-            if mode in ('render', 'both'):
-                cmd = build_ffmpeg_cmd(clips, out, encoder, quality, max_w, max_h, fps,
-                                       style=style_key, custom_lut=custom_lut)
+            if preview:
+                preview_path = str(Path(out).with_name(Path(out).stem + '-preview.mp4'))
+                cmd = build_preview_cmd(clips, preview_path, encoder, max_w, max_h, fps,
+                                        style=style_key, custom_lut=custom_lut)
+                self._preview_output = preview_path
+                self.log.append(f"--- Preview (style={style_key}) -> {preview_path} ---")
+                total_dur = min(12.0, len(clips) * 1.0)
+            else:
+                if mode in ('kdenlive', 'both'):
+                    kdenlive_path = Path(out).with_suffix('.kdenlive')
+                    kdenlive_args = (clips, kdenlive_path, max_w, max_h, fps,
+                                     self.gap_spin.value(), style_key, custom_lut,
+                                     music_path)
+                if mode in ('render', 'both'):
+                    cmd = build_ffmpeg_cmd(clips, out, encoder, quality, max_w, max_h, fps,
+                                           style=style_key, custom_lut=custom_lut,
+                                           music_path=music_path)
+                self.log.append(
+                    f"--- Lancement (mode={mode}, encoder={encoder}, {max_w}x{max_h}@{fps}fps, q={quality}, style={style_key}) ---"
+                )
+                total_dur = sum(trimmed_duration(c) for c in clips)
 
             self.launch_btn.setEnabled(False)
+            self.preview_btn.setEnabled(False)
             self.progress.setVisible(True)
             self.progress.setRange(0, 100)
             self.progress.setValue(0)
-            self.log.append(
-                f"--- Lancement (mode={mode}, encoder={encoder}, {max_w}x{max_h}@{fps}fps, q={quality}, style={style_key}) ---"
-            )
 
-            total_dur = sum(c['duration'] for c in clips)
             self.encode_thread = EncodeThread(cmd, kdenlive_args, total_dur)
             self.encode_thread.log_line.connect(self.log.append)
             self.encode_thread.progress_pct.connect(self.progress.setValue)
@@ -1275,9 +1787,18 @@ def run_ui():
         def on_encode_done(self, code):
             self.progress.setVisible(False)
             self.launch_btn.setEnabled(True)
+            self.preview_btn.setEnabled(True)
             if code == 0:
                 self.log.append("--- Termine avec succes ---")
-                QMessageBox.information(self, "Termine", "Encodage / projet termine !")
+                if self._preview_output:
+                    try:
+                        from PySide6.QtCore import QUrl
+                        from PySide6.QtGui import QDesktopServices
+                        QDesktopServices.openUrl(QUrl.fromLocalFile(self._preview_output))
+                    except Exception as e:
+                        self.log.append(f"(Ouverture preview echouee: {e})")
+                else:
+                    QMessageBox.information(self, "Termine", "Encodage / projet termine !")
             else:
                 self.log.append(f"--- Echec (code {code}) ---")
                 QMessageBox.warning(self, "Erreur",
@@ -1318,6 +1839,15 @@ def main():
     parser.add_argument('--lut', dest='custom_lut', default=None,
                         help="Chemin vers un fichier .cube (force style=custom). "
                              "Sinon, auto-detect d'un .cube dans le dossier source.")
+    parser.add_argument('--target-duration', dest='target_minutes', type=int, default=0,
+                        help="Duree cible en minutes (0=desactive). Si >0, decoupe les clips "
+                             "longs en sub-clips, score, garde les meilleurs pour atteindre la cible.")
+    parser.add_argument('--preview', action='store_true',
+                        help="Genere un preview MP4 court (~12s) au lieu du montage complet.")
+    parser.add_argument('--music', dest='music_path', default=None,
+                        help="Fichier audio (MP3/WAV/...) ajoute en piste A2 dans le projet Kdenlive.")
+    parser.add_argument('--beat-sync', dest='beat_sync', action='store_true',
+                        help="Si --music fourni, aligne les cuts sur les beats detectes (librosa).")
     args = parser.parse_args()
 
     if not args.folder:
